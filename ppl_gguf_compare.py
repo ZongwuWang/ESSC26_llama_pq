@@ -41,7 +41,11 @@ def prepare_dataset(output: Path) -> None:
         print(f"dataset already exists: {output}")
         return
     output.parent.mkdir(parents=True, exist_ok=True)
-    dataset = load_dataset("wikitext", "wikitext-2-raw-v1")
+    dataset = load_dataset(
+        "Salesforce/wikitext",
+        "wikitext-2-raw-v1",
+        revision="b08601e04326c79dfdd32d625aee71d232d685c3",
+    )
     dataset.save_to_disk(str(output))
     print(f"saved WikiText-2 to {output}")
 

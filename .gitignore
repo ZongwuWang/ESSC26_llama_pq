@@ -1,8 +1,8 @@
 .venv/
 build/
 output/
-models/
-datasets/
+/models/
+/datasets/
 __pycache__/
 *.pyc
 *.gguf

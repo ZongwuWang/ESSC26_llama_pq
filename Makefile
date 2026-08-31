@@ -77,6 +77,7 @@ help:
 	@echo "  make plot           Render throughput and PPL charts"
 
 all: env
+	$(MAKE) prepare-inputs
 	$(MAKE) check-inputs
 	$(MAKE) llama-build
 	$(MAKE) selftest

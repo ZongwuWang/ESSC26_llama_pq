@@ -9,7 +9,8 @@ dependencies = [
   "huggingface-hub>=0.27,<2",
   "matplotlib>=3.8,<4",
   "numpy>=1.26,<3",
-  "torch>=2.2,<3",
+  "socksio>=1.0,<2",
+  "torch==2.8.0",
   "transformers>=4.40,<6",
 ]
 

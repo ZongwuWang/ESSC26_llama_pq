@@ -1,219 +1,196 @@
-# AE Usage Guide
+# EdgePQ
 
-This directory is a self-contained artifact-evaluation project for comparing
-FP16, Q2_K, and PQ-4c8b Llama-2-7B decode performance. Run all commands below
-from this directory.
+EdgePQ is a CPU-native 2-bit product-quantized LLM decoding system built on a
+vendored, PQ-extended version of [llama.cpp](https://github.com/ggml-org/llama.cpp).
+It uses input-partitioned (S1) and output-partitioned (S2) PQ layouts to execute
+Llama-2-7B decoding on many-core x86 CPUs.
 
-## 1. Requirements
+## Main Results
 
-- A Linux x86-64 system with a C++17 compiler.
-- CMake and Ninja.
-- The CPU features required by the selected llama.cpp build. The PQ path is
-  intended for AVX-512 FP16 and VBMI CPUs.
-- Three compatible Llama-2-7B GGUF files:
-  - an F16 model;
-  - a standard llama.cpp Q2_K model;
-  - the generated PQ-4c8b model.
+The paper reports the following results with 60 CPU threads:
 
-The three GGUF model paths are provided as command-line arguments or Makefile
-variables.
+| Model | TG128 | TG512 | WikiText-2 PPL |
+|---|---:|---:|---:|
+| F16 | 18.80 +/- 0.79 | 20.55 +/- 0.34 | 6.12 |
+| Q2_K | 48.07 +/- 1.35 | 47.80 +/- 0.79 | 7.74 |
+| EdgePQ | **55.35 +/- 0.64** | **50.73 +/- 1.87** | **6.33** |
 
-## 2. Expected repository layout
+The EdgePQ PPL value is measured by reconstructing the trained PQ checkpoint
+into an FP16 Transformers model. Throughput uses the PQ side tensors embedded
+in `base-pq-4c8b.gguf`.
 
-The project layout is:
+**Video demo:** see [`video_demo/`](video_demo/).
+
+## Requirements
+
+- Linux x86-64
+- AVX-512 FP16, VBMI, and VNNI for the optimized PQ path
+- GCC/G++, CMake, Ninja, and `uv`
+- 64 GB RAM or more
+- NVIDIA GPU with at least 32 GB memory for the full PPL run
+- About 60 GB free disk space
+
+The CPU throughput path does not require a GPU. CUDA is enabled in the default
+build because `make ppl` and `make pq-ppl` use GPU evaluation.
+
+## Repository Layout
 
 ```text
-.
-├── CMakeLists.txt
-├── Makefile
-├── README.md
-├── llama_pq.cpp
-└── llama.cpp/
-    ├── CMakeLists.txt
-    ├── include/
-    ├── ggml/
-    ├── common/
-    └── src/
+ESSC26_llama_pq/
+|-- pyproject.toml        # uv environment specification
+|-- uv.lock               # locked Python dependencies
+|-- Makefile              # all artifact commands
+|-- llama_pq.cpp          # FP16 vs Q2_K vs EdgePQ throughput
+|-- ppl_gguf_compare.py   # dataset and PPL evaluation
+|-- plot_results.py       # throughput and PPL charts
+|-- llama.cpp/            # vendored, PQ-extended llama.cpp
+|   |-- tools/pq-convert/ # checkpoint exporter
+|   `-- tools/pq-selftest/# correctness self-test
+|-- video_demo/           # artifact walkthrough
+`-- output/               # generated CSVs and charts (not tracked)
 ```
 
-Model files must be available at the paths specified for the evaluation.
+## Prepare Inputs
 
-## 3. Build the bundled llama.cpp
+The public model repository
+[`ZongwuWang/EdgePQ-4c8b`](https://huggingface.co/ZongwuWang/EdgePQ-4c8b)
+contains:
 
-The Makefile automatically configures and builds the llama.cpp source bundled
-under `./llama.cpp`:
+- `base-pq-4c8b.gguf`, which carries the deployable EdgePQ side tensors (the
+  paper's FP16 baseline remains the separate `Llama-2-7b-chat-hf-f16.gguf`);
+- `best-formal-hard/non_pq_state.pt`;
+- all 224 files under `best-formal-hard/pq_states/`;
+- `tokenizer.json`, `tokenizer.model`, and `tokenizer_config.json`.
+
+The prepared inputs are loaded directly: `Llama-2-7b-chat-hf-f16.gguf` for FP16,
+`Llama-2-7b-chat-hf-Q2_K.gguf` for Q2_K, and `base-pq-4c8b.gguf` for PQ-4c8b.
+The artifact does not rename or regenerate these files.
+
+Create the Python environment and prepare the default inputs:
 
 ```bash
+make env
+make prepare-inputs
+```
+
+This downloads the public EdgePQ GGUF/checkpoint/tokenizer, the F16 and Q2_K GGUFs from
+[`second-state/Llama-2-7B-Chat-GGUF`](https://huggingface.co/second-state/Llama-2-7B-Chat-GGUF),
+and WikiText-2 directly from Hugging Face.
+
+Default paths:
+
+```text
+models/base-pq-4c8b.gguf
+models/Llama-2-7b-chat-hf-f16.gguf
+models/Llama-2-7b-chat-hf-Q2_K.gguf
+models/best-formal-hard/
+models/tokenizer/
+datasets/wikitext-2-raw-v1/
+```
+
+All paths are Make variables and can be overridden:
+
+```bash
+make all \
+  PQ_MODEL=/data/base-pq-4c8b.gguf \
+  FP16_MODEL=/data/Llama-2-7b-chat-hf-f16.gguf \
+  Q2_MODEL=/data/Llama-2-7b-chat-hf-Q2_K.gguf \
+  PQ_CHECKPOINT=/data/best-formal-hard \
+  PPL_DATASET=/data/wikitext-2-raw-v1 \
+  TOKENIZER=/data/llama2-tokenizer \
+  CUDA_DEVICE=0
+```
+
+## Build
+
+```bash
+make env
 make llama-build
 ```
 
-The build output is placed in `build`.
+The build includes `llama-perplexity`, `llama-quantize`, `pq-selftest`, and
+`llama-pq-convert`, followed by the root `llama_pq` runner when needed.
 
-## 4. Build the AE program
+## Quick Check
 
-### Makefile build
-
-```bash
-make
-```
-
-The executable is `./llama_pq`. The default Makefile target also builds the
-bundled llama.cpp libraries when needed.
-
-### CMake build
+Validate all external inputs:
 
 ```bash
-rm -rf build
-
-env -i HOME="$HOME" \
-  PATH=/usr/local/bin:/usr/bin:/bin \
-  cmake -S . -B build -G Ninja \
-  -DCMAKE_BUILD_TYPE=Release \
-  -DLLAMA_SRC="$PWD/llama.cpp" \
-  -DLLAMA_BUILD="$PWD/build"
-
-env -i HOME="$HOME" \
-  PATH=/usr/local/bin:/usr/bin:/bin \
-  ninja -C build
+make check-inputs
 ```
 
-## 5. Run the complete AE comparison
+Run the standalone correctness test and a short three-model decode test:
 
-The simplest reproducible command is:
+```bash
+make selftest
+make smoke
+```
+
+The smoke target runs eight generated tokens with one measured repetition and
+does not write a result file.
+
+## Reproduce the Paper
+
+Run the complete evaluation:
+
+```bash
+make all
+```
+
+Render the CSV results:
+
+```bash
+make plot
+```
+
+Individual stages are also available:
 
 ```bash
 make benchmark
+make ppl
+make pq-ppl
 ```
 
-This command:
+The complete PPL evaluation can take one to three hours.
 
-- builds `./llama_pq` if needed;
-- evaluates FP16, Q2_K, and PQ-4c8b;
-- uses 60 CPU threads;
-- uses distributed NUMA placement;
-- performs one one-token warmup per model and generation length;
-- runs TG128 and TG512;
-- repeats each test three times;
-- writes the CSV result to `essc-pq-comparison.csv`.
+The paper settings are fixed in the Makefile: F16/Q2_K use context 3072 and
+stride 2048; PQ reconstruction uses context/stride 4096.
 
-Inspect the result with:
-
-```bash
-cat essc-pq-comparison.csv
-```
-
-The expected CSV schema is:
+## Output Files
 
 ```text
-model,path,generation,tokens_per_second,stdev
-F16,...,128,...,...
-F16,...,512,...,...
-Q2_K,...,128,...,...
-Q2_K,...,512,...,...
-PQ-4c8b,...,128,...,...
-PQ-4c8b,...,512,...,...
+output/throughput.csv
+output/perplexity.csv
+output/throughput.png
+output/ppl.png
 ```
 
-## 6. Run with explicit parameters
+No persistent run logs are generated. Command output is printed to the terminal,
+and any failed stage returns a non-zero exit status.
 
-Run the evaluator directly with explicit model paths:
+## Clean Up
 
-```bash
-GGML_PQ_STRIPE=1 \
-OMP_DYNAMIC=FALSE \
-OMP_PROC_BIND=spread \
-OMP_PLACES=cores \
-./llama_pq \
-  --fp16 ../../models/Llama-2-7b-chat-hf.gguf \
-  --q2 ../../models/Llama-2-7b-chat-hf-GGUF/Llama-2-7b-chat-hf.Q2_K.gguf \
-  --pq ../../llama.cpp/base-pq-4c8b.gguf \
-  --threads 60 \
-  --repetitions 3 \
-  --warmup 1 \
-  --generations 128,512 \
-  --context 2048 \
-  --numa distribute \
-  --output essc-pq-comparison.csv
-```
-
-Available options:
-
-| Option | Default | Description |
-|---|---:|---|
-| `--fp16 PATH` | required | F16 GGUF model |
-| `--q2 PATH` | required | standard Q2_K GGUF model |
-| `--pq PATH` | required | PQ-4c8b GGUF model |
-| `--threads N` | `60` | generation and batch thread count |
-| `--repetitions N` | `3` | measured repetitions |
-| `--warmup N` | `1` | one-token warmup repetitions |
-| `--generations LIST` | `128,512` | comma-separated generation lengths |
-| `--context N` | `2048` | minimum context size; actual size is at least generation length |
-| `--numa MODE` | `distribute` | `distribute`, `isolate`, or `disabled` |
-| `--output PATH` | stdout | CSV output path |
-
-## 7. Override Makefile parameters
-
-```bash
-make benchmark \
-  AE_THREADS=60 \
-  AE_REPETITIONS=5 \
-  AE_WARMUP=1 \
-  AE_GENERATIONS=128,512 \
-  AE_CONTEXT=2048 \
-  AE_NUMA=distribute \
-  AE_OUTPUT=my-ae.csv
-```
-
-Override model locations as follows:
-
-```bash
-make benchmark \
-  FP16_MODEL=/data/models/model-f16.gguf \
-  Q2_MODEL=/data/models/model.Q2_K.gguf \
-  PQ_MODEL=/data/models/base-pq-4c8b.gguf
-```
-
-## 8. Correctness and runtime checks
-
-Before performance testing, verify that the llama.cpp libraries are found:
-
-```bash
-ldd ./llama_pq | grep -E 'libllama|libggml|not found'
-```
-
-No `not found` line should be printed.
-
-For a quick CLI check:
-
-```bash
-./llama_pq --help
-```
-
-## 9. Interpreting results
-
-The reported value is generated tokens per second. It is measured only around
-`llama_decode` calls and synchronization; model loading is excluded from the
-throughput measurement. The F16, Q2_K, and PQ runs use the same thread count,
-NUMA mode, generation lengths, warmup policy, and repetition count.
-
-The PQ GGUF currently retains the original F16 tensors for prefill
-compatibility. Therefore, its on-disk size is not the same as the decode-time
-weight stream. During PQ decode, the llama.cpp loader registers the PQ side
-tensors and the runtime selects the PQ GEMV path for one-token decode.
-
-System load, page-cache state, CPU frequency, and NUMA placement can affect
-results. For paper numbers, record the complete command, commit IDs, CPU
-information, and the CSV output. Do not mix values from different benchmark
-configurations in one comparison table.
-
-## 10. Cleanup
+Remove only the root runner:
 
 ```bash
 make clean
 ```
 
-This removes the AE executable. To remove the local llama.cpp build output:
+Remove the build, virtual environment, and generated output:
 
 ```bash
-rm -rf build
+make distclean
 ```
+
+Model and dataset inputs are never removed by these targets.
+
+## Acknowledgements
+
+- [llama.cpp](https://github.com/ggml-org/llama.cpp)
+- [T-MAC](https://github.com/microsoft/T-MAC)
+- Product quantization work cited in the accompanying paper
+
+## License
+
+This repository is released under the terms in [`LICENSE`](LICENSE). The
+Llama-2 model and derived artifacts remain subject to their applicable licenses.

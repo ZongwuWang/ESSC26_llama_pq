@@ -1,2 +1,11 @@
+.venv/
 build/
+output/
+models/
+datasets/
+__pycache__/
+*.pyc
+*.gguf
+*.pt
 llama_pq
+llama.cpp/bench-results/

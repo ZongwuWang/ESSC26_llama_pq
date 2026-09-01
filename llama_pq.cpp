@@ -23,6 +23,8 @@ struct Options {
     std::string q2_model;
     std::string pq_model;
     std::string output;
+    std::string prompt;   // non-empty: greedy completion mode with this prompt
+    std::string only;     // comma-separated subset of {F16,Q2_K,PQ-4c8b}
     int threads = 60;
     int repetitions = 3;
     int warmup = 1;
@@ -47,6 +49,9 @@ static void usage(const char * program) {
         << "  --q2 PATH                Q2_K GGUF model\n"
         << "  --pq PATH                PQ-4c8b GGUF model\n\n"
         << "Options:\n"
+        << "  --prompt TEXT            greedy completion mode: print generated text and\n"
+        << "                           TG tokens/s for each model (no CSV benchmark)\n"
+        << "  --only LIST              comma-separated model subset: F16,Q2_K,PQ-4c8b\n"
         << "  --threads N              CPU threads (default: 60)\n"
         << "  --repetitions N          measured repetitions (default: 3)\n"
         << "  --warmup N               warmup repetitions (default: 1)\n"
@@ -126,6 +131,10 @@ static Options parse_options(int argc, char ** argv) {
             options.numa = parse_numa(require_value(i, argc, argv, "--numa"));
         } else if (arg == "--output") {
             options.output = require_value(i, argc, argv, "--output");
+        } else if (arg == "--prompt") {
+            options.prompt = require_value(i, argc, argv, "--prompt");
+        } else if (arg == "--only") {
+            options.only = require_value(i, argc, argv, "--only");
         } else {
             throw std::runtime_error("unknown option: " + arg);
         }
@@ -216,6 +225,85 @@ static std::vector<double> run_generation(llama_model * model, const Options & o
     return samples;
 }
 
+// greedy completion on a real prompt: prints generated text and TG tokens/s
+static double run_completion(llama_model * model, const Options & options, int n_gen) {
+    const llama_vocab * vocab = llama_model_get_vocab(model);
+    std::vector<llama_token> tokens(512);
+    int n_prompt = llama_tokenize(vocab, options.prompt.c_str(),
+                                  (int32_t) options.prompt.size(), tokens.data(),
+                                  (int32_t) tokens.size(), true, true);
+    if (n_prompt < 0) {
+        tokens.resize((size_t)(-n_prompt));
+        n_prompt = llama_tokenize(vocab, options.prompt.c_str(),
+                                  (int32_t) options.prompt.size(), tokens.data(),
+                                  (int32_t) tokens.size(), true, true);
+    }
+    if (n_prompt <= 0) {
+        throw std::runtime_error("failed to tokenize prompt: " + options.prompt);
+    }
+    tokens.resize((size_t) n_prompt);
+
+    llama_context_params context_params = llama_context_default_params();
+    context_params.n_ctx = (uint32_t)(n_prompt + n_gen);
+    context_params.n_batch = 2048;
+    context_params.n_threads = options.threads;
+    context_params.n_threads_batch = options.threads;
+
+    llama_context * context = llama_init_from_model(model, context_params);
+    if (context == nullptr) {
+        throw std::runtime_error("failed to create llama context");
+    }
+
+    std::cout << "[AE] completion: '" << options.prompt << "'" << '\n' << std::flush;
+
+    if (llama_decode(context, llama_batch_get_one(tokens.data(), n_prompt)) != 0) {
+        llama_free(context);
+        throw std::runtime_error("prompt decode failed");
+    }
+
+    const int32_t n_vocab = llama_vocab_n_tokens(vocab);
+    const auto sample_greedy = [&]() {
+        const float * logits = llama_get_logits_ith(context, -1);
+        llama_token best = 0;
+        for (int32_t t = 1; t < n_vocab; ++t) {
+            if (logits[t] > logits[best]) {
+                best = t;
+            }
+        }
+        return best;
+    };
+
+    llama_token token = sample_greedy();
+    const auto begin = std::chrono::steady_clock::now();
+    int generated = 0;
+    for (int i = 0; i < n_gen; ++i) {
+        if (llama_vocab_is_eog(vocab, token)) {
+            std::cout << " [EOG]" << '\n' << std::flush;
+            break;
+        }
+        char piece[128];
+        const int n = llama_token_to_piece(vocab, token, piece, sizeof(piece), 0, true);
+        if (n > 0) {
+            std::cout << std::string(piece, (size_t) n) << std::flush;
+        }
+        if (llama_decode(context, llama_batch_get_one(&token, 1)) != 0) {
+            llama_free(context);
+            throw std::runtime_error("decode failed");
+        }
+        token = sample_greedy();
+        ++generated;
+    }
+    const auto end = std::chrono::steady_clock::now();
+    const double seconds = elapsed_seconds(begin, end);
+
+    llama_free(context);
+    if (generated == 0) {
+        return 0.0;
+    }
+    std::cout << '\n' << std::flush;
+    return generated / seconds;
+}
+
 static std::vector<Measurement> evaluate_model(const std::string & name, const std::string & path,
                                                bool pq, const Options & options) {
     llama_model_params model_params = llama_model_default_params();
@@ -234,6 +322,13 @@ static std::vector<Measurement> evaluate_model(const std::string & name, const s
 
     std::vector<Measurement> results;
     for (const int n_gen : options.generations) {
+        if (!options.prompt.empty()) {
+            const double tps = run_completion(model, options, n_gen);
+            std::cout << "[AE] " << name << " tg" << n_gen << ": " << std::fixed
+                      << std::setprecision(2) << tps << " tokens/s\n" << std::flush;
+            results.push_back({name, path, n_gen, tps, 0.0});
+            continue;
+        }
         const std::vector<double> samples = run_generation(model, options, n_gen, 0x4c4c4d41ULL);
         for (size_t repetition = 0; repetition < samples.size(); ++repetition) {
             std::cout << "[AE] " << name << " tg" << n_gen << " run " << (repetition + 1)
@@ -289,9 +384,16 @@ int main(int argc, char ** argv) {
         };
         std::vector<Measurement> results;
         for (const auto & entry : models) {
+            if (!options.only.empty() && options.only.find(entry.first) == std::string::npos) {
+                continue;
+            }
             const std::vector<Measurement> model_results = evaluate_model(
                 entry.first, entry.second.first, entry.second.second, options);
             results.insert(results.end(), model_results.begin(), model_results.end());
+        }
+        if (!options.prompt.empty() && options.output.empty()) {
+            // completion mode: the text and per-run rates above are the result
+            return EXIT_SUCCESS;
         }
         write_csv(options.output, results);
         llama_backend_free();

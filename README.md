@@ -39,56 +39,55 @@ flowchart LR
 
 ## Main Results
 
-The paper reports the following results with 60 CPU threads:
+The paper reports the following results with 60 CPU threads on the evaluation
+platform described in the paper:
 
 | Model | TG128 (tok/s) | TG512 (tok/s) | WikiText-2 PPL |
 |---|---:|---:|---:|
-| F16 | 18.80 ± 0.79 | 20.55 ± 0.34 | 6.12 |
-| Q2_K | 48.07 ± 1.35 | 47.80 ± 0.79 | 7.74 |
-| **EdgePQ** | **55.35 ± 0.64** | **50.73 ± 1.87** | **6.33** |
+| F16 | 25.24 ± 0.38 | 24.10 ± 0.77 | 6.09 |
+| Q2_K | 38.11 ± 0.89 | 34.24 ± 0.37 | 7.75 |
+| **EdgePQ** | **56.50 ± 0.64** | **53.04 ± 0.58** | **6.33** |
 
-The EdgePQ PPL value is measured by reconstructing the trained PQ checkpoint
-into an FP16 Transformers model and evaluating complete, non-overlapping
-4096-token WikiText-2 windows. Throughput uses the PQ side tensors embedded in
+EdgePQ is 2.24×/2.20× faster than F16 and 48.3%/54.9% faster than Q2_K at
+TG128/TG512. Its PPL is 18.3% lower than Q2_K and within 3.9% of F16. The
+unrounded reproduced PPL values are 6.0944 (F16), 7.7528 (Q2_K), and 6.3286
+(EdgePQ); the table shows the two-decimal values used in the paper.
+
+EdgePQ PPL is measured by reconstructing the trained PQ checkpoint into an
+FP16 Transformers model and evaluating complete, non-overlapping 4096-token
+WikiText-2 windows. Throughput loads the PQ side tensors embedded in
 `base-pq-4c8b.gguf`.
 
 > [!IMPORTANT]
-> The table contains the paper-reported reference values. A reproduction run
-> writes its measured values to `output/throughput.csv` and
-> `output/perplexity.csv`; those CSV files are the source of truth for that run.
+> The table contains the paper reference values. Every reproduction writes its
+> own measurements to `output/throughput.csv` and `output/perplexity.csv`.
+> Absolute CPU throughput can vary with CPU load, NUMA placement, page-cache
+> state, and background contention; compare runs under the same conditions.
 
 ## Demo
 
-The ten-minute walkthrough covers a fresh clone, environment and input setup,
-correctness checks, the full evaluation, and result inspection. Watch or
-download it from [`video_demo/demo.mp4`](video_demo/demo.mp4); the accompanying
-workflow summary is in [`video_demo/`](video_demo/).
+The ten-minute walkthrough covers environment and input preparation,
+correctness checks, the three-model smoke test, evaluation, and result
+inspection. [Watch or download the video](video_demo/demo.mp4).
 
 ## Quick Start
 
 ```bash
 git clone https://github.com/ZongwuWang/ESSC26_llama_pq.git
 cd ESSC26_llama_pq
-
-make env
-make prepare-inputs
-make check-inputs
-make selftest
-make smoke
-```
-
-For a concise, recording-friendly validation after the inputs are cached:
-
-```bash
 make demo
 ```
 
-The demo target is a hands-off recording workflow. It creates or reuses
-`.venv`, downloads only missing inputs, reuses `build/`, runs the PQ self-test,
-and loads all three models for an eight-token smoke test. If complete paper
-CSVs already exist, it reuses them; otherwise it continues with the full
-benchmark and PPL evaluation. It always renders the charts and prints a compact
-throughput/PPL table directly in the terminal.
+`make demo` is the one-command artifact entry point. It creates or reuses the
+locked `.venv`, downloads only missing inputs, validates them, builds or reuses
+the runtime, runs `pq-selftest`, and loads all three models in an eight-token
+smoke test. When both result CSVs exist and are non-empty, it reuses them;
+otherwise it runs the full benchmark and PPL evaluation. It then renders both
+charts and prints the throughput/PPL table in the terminal.
+
+The first run downloads approximately 60 GB of inputs and can take one to three
+hours because it performs the complete PPL evaluation. Later runs reuse the
+environment, models, dataset, build, and existing result CSVs.
 
 For the complete measurement and plot pipeline:
 
@@ -97,14 +96,13 @@ make all
 make plot
 ```
 
-> [!TIP]
-> `make all` runs the measurements and produces CSV files. `make plot` is a
-> separate step that renders the two PNG charts.
+`make all` always reruns every measurement and produces fresh CSV files;
+`make plot` renders the two PNG charts from those files.
 
 ### Reuse a persistent input cache
 
-Models and datasets do not need to be downloaded again for each recording or
-checkout. Prepare a persistent cache once:
+Models and datasets can be shared across checkouts. Prepare a persistent input
+cache once:
 
 ```bash
 CACHE_ROOT=/data/edgepq-artifact-cache
@@ -130,14 +128,6 @@ make all \
 `hf download` reuses the local-dir metadata and completed files, WikiText-2 is
 not downloaded again when its saved dataset directory exists, `uv` reuses its
 global package cache, and Ninja reuses `build/` in the same checkout.
-
-For a ten-minute recording, run the full `make all` once before recording and
-retain `output/`. During the recording, one `make demo` command performs the
-live validation, reuses the validated CSVs, renders both charts, and prints the
-key numbers. If no CSVs are present, the same command automatically performs
-the full evaluation and may take one to three hours. If the video must show
-`make all`, start it on screen, explain the expected duration, and cut to the
-completed output rather than implying an instant run.
 
 ## Requirements
 
@@ -185,7 +175,8 @@ This downloads the EdgePQ GGUF, Q2_K baseline, checkpoint, and tokenizer from
 [`ZongwuWang/EdgePQ-4c8b`](https://huggingface.co/ZongwuWang/EdgePQ-4c8b),
 the F16 GGUF from
 [`second-state/Llama-2-7B-Chat-GGUF`](https://huggingface.co/second-state/Llama-2-7B-Chat-GGUF),
-and WikiText-2 directly from Hugging Face.
+and WikiText-2 directly from Hugging Face. Model revisions are pinned in the
+Makefile, and the WikiText-2 revision is pinned in `ppl_gguf_compare.py`.
 
 Default paths:
 
@@ -281,7 +272,7 @@ ESSC26_llama_pq/
 |-- llama.cpp/            # vendored, PQ-extended llama.cpp
 |   |-- tools/pq-convert/ # checkpoint exporter
 |   `-- tools/pq-selftest/# correctness self-test
-|-- video_demo/           # recording plan and final walkthrough
+|-- video_demo/           # recorded artifact walkthrough
 `-- output/               # generated CSVs and charts, not tracked
 ```
 

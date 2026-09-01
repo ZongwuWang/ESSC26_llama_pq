@@ -236,28 +236,6 @@ ESSC26_llama_pq/
 
 </details>
 
-## Clean Up
-
-Remove only the root benchmark runner:
-
-```bash
-make clean
-```
-
-Remove the build, virtual environment, and generated outputs:
-
-```bash
-make distclean
-```
-
-Model and dataset inputs are never removed by these targets.
-
-## Acknowledgements
-
-- [llama.cpp](https://github.com/ggml-org/llama.cpp)
-- [T-MAC](https://github.com/microsoft/T-MAC)
-- The product-quantization work cited in the accompanying paper
-
 ## License
 
 This repository is released under the terms in [`LICENSE`](LICENSE). The

@@ -13,7 +13,7 @@ EdgePQ co-designs product quantization and SIMD lookup-table execution to run
 Llama-2-7B decoding directly on commodity CPUs, with no GPU in the decoding
 critical path.
 
-[Why EdgePQ](#why-edgepq) · [Results](#main-results) · [Quick Start](#quick-start) · [Reproduction](#step-by-step-reproduction) · [Demo](#demo)
+[Why EdgePQ](#why-edgepq) · [Results](#main-results) · [Demo](#demo) · [Requirements](#requirements) · [Quick Start](#quick-start) · [Reproduction](#step-by-step-reproduction)
 
 </div>
 
@@ -59,58 +59,6 @@ The ten-minute walkthrough covers environment and input preparation,
 correctness checks, the three-model smoke test, evaluation, and result
 inspection. [Watch or download the video](video_demo/demo.mp4).
 
-## Quick Start
-
-```bash
-git clone https://github.com/ZongwuWang/ESSC26_llama_pq.git
-cd ESSC26_llama_pq
-make demo
-```
-
-`make demo` is the one-command artifact entry point. It creates or reuses the
-locked `.venv`, downloads only missing inputs, validates them, builds or reuses
-the runtime, runs `pq-selftest`, and loads all three models in an eight-token
-smoke test. When both result CSVs exist and are non-empty, it reuses them;
-otherwise it runs the full benchmark and PPL evaluation. It then renders both
-charts and prints the throughput/PPL table in the terminal.
-
-The first run downloads approximately 60 GB of inputs and can take one to three
-hours because it performs the complete PPL evaluation. Later runs reuse the
-environment, models, dataset, build, and existing result CSVs.
-
-<details>
-<summary><strong>Reuse a persistent input cache</strong></summary>
-
-Models and datasets can be shared across checkouts. Prepare a persistent input
-cache once:
-
-```bash
-CACHE_ROOT=/data/edgepq-artifact-cache
-
-make prepare-inputs \
-  MODEL_DIR="$CACHE_ROOT/models" \
-  DATASET_DIR="$CACHE_ROOT/datasets"
-```
-
-Then pass the same directories to any target:
-
-```bash
-make demo \
-  MODEL_DIR="$CACHE_ROOT/models" \
-  DATASET_DIR="$CACHE_ROOT/datasets"
-
-make all \
-  MODEL_DIR="$CACHE_ROOT/models" \
-  DATASET_DIR="$CACHE_ROOT/datasets" \
-  CUDA_DEVICE=0
-```
-
-`hf download` reuses the local-dir metadata and completed files, WikiText-2 is
-not downloaded again when its saved dataset directory exists, `uv` reuses its
-global package cache, and Ninja reuses `build/` in the same checkout.
-
-</details>
-
 ## Requirements
 
 | Workflow | Requirements |
@@ -131,7 +79,27 @@ make smoke GGML_CUDA=OFF
 
 Do not run `make ppl` or `make pq-ppl` in the CPU-only workflow.
 
-## Prepare Inputs
+## Quick Start
+
+```bash
+git clone https://github.com/ZongwuWang/ESSC26_llama_pq.git
+cd ESSC26_llama_pq
+make demo
+```
+
+`make demo` is the one-command artifact entry point. It creates or reuses the
+locked `.venv`, downloads only missing inputs, validates them, builds or reuses
+the runtime, runs `pq-selftest`, and loads all three models in an eight-token
+smoke test. If both result CSVs are non-empty, it reuses them; otherwise it runs
+the complete benchmark and PPL evaluation. It then prints the result table and
+renders both charts.
+
+The first run downloads approximately 60 GB and can take one to three hours.
+Later runs reuse the environment, inputs, build, and existing result CSVs.
+
+## Step-by-Step Reproduction
+
+### 1. Environment and Inputs
 
 ```bash
 make env
@@ -139,9 +107,9 @@ make prepare-inputs
 make check-inputs
 ```
 
-`make prepare-inputs` downloads only missing files; `make check-inputs` verifies
-the three GGUFs, all 224 PQ states, tokenizer files, and WikiText-2. Repeated
-runs reuse completed files.
+`make env` installs the locked Python environment. `make prepare-inputs`
+downloads only missing files, and `make check-inputs` verifies the three GGUFs,
+all 224 PQ states, tokenizer files, and WikiText-2.
 
 | Input | Default path | Public source |
 |---|---|---|
@@ -153,56 +121,50 @@ runs reuse completed files.
 
 Model revisions are pinned in the Makefile, and the WikiText-2 revision is
 pinned in `ppl_gguf_compare.py`. The artifact loads these files directly and
-does not rename or regenerate the baseline GGUFs.
+does not rename or regenerate the baseline GGUFs. Repeated runs reuse completed
+files.
 
-<details>
-<summary><strong>Use custom input paths</strong></summary>
-
-All input paths and runtime choices are Make variables:
-
-```bash
-make all \
-  PQ_MODEL=/data/base-pq-4c8b.gguf \
-  FP16_MODEL=/data/Llama-2-7b-chat-hf-f16.gguf \
-  Q2_MODEL=/data/Llama-2-7b-chat-hf.Q2_K.gguf \
-  PQ_CHECKPOINT=/data/best-formal-hard \
-  PPL_DATASET=/data/wikitext-2-raw-v1 \
-  TOKENIZER=/data/llama2-tokenizer \
-  CUDA_DEVICE=0
-```
-
-</details>
-
-## Step-by-Step Reproduction
+### 2. Build and Validate
 
 ```bash
 make llama-build
 make selftest
 make smoke
-make benchmark
-make ppl
-make pq-ppl
-make plot
 ```
 
 The build includes `llama-perplexity`, `llama-quantize`, `pq-selftest`, and
-`llama-pq-convert`. The root `llama_pq` benchmark runner is built when a target
-needs it. `make smoke` generates eight tokens for each of the three models with
-one measured repetition and does not retain a result file.
+`llama-pq-convert`. `make selftest` compares registered PQ execution with the
+reference path; `make smoke` loads F16, Q2_K, and EdgePQ and generates eight
+tokens with each model.
+
+### 3. Run Measurements
+
+```bash
+make benchmark
+make ppl
+make pq-ppl
+```
 
 | Command | Purpose | Main output |
 |---|---|---|
-| `make selftest` | Compare registered PQ execution with the reference path | Terminal PASS/failure |
 | `make benchmark` | Measure F16, Q2_K, and EdgePQ decode throughput | `output/throughput.csv` |
 | `make ppl` | Evaluate F16 and Q2_K perplexity | `output/perplexity.csv` |
 | `make pq-ppl` | Evaluate reconstructed EdgePQ perplexity | Appends to `output/perplexity.csv` |
-| `make plot` | Render both result CSVs | Two PNG charts |
 
-To force every measurement to rerun, use `make all` followed by `make plot`.
 The complete PPL evaluation can take one to three hours. The default Make
 variables match the paper protocol: F16/Q2_K use context 3072 and stride 2048;
 PQ reconstruction uses context and stride 4096. These defaults can be
 overridden when running controlled experiments.
+
+### 4. Render Results
+
+```bash
+make plot
+```
+
+`make plot` prints the measured values and renders the throughput and PPL
+charts. To force every measurement to rerun, use `make all` followed by
+`make plot`.
 
 ## Output Files
 
@@ -215,6 +177,48 @@ overridden when running controlled experiments.
 
 No persistent run logs are generated. Command output is printed to the
 terminal, and a failed stage returns a non-zero exit status.
+
+## Advanced Usage
+
+<details>
+<summary><strong>Reuse a persistent input cache</strong></summary>
+
+Models and datasets can be shared across checkouts:
+
+```bash
+CACHE_ROOT=/data/edgepq-artifact-cache
+
+make prepare-inputs \
+  MODEL_DIR="$CACHE_ROOT/models" \
+  DATASET_DIR="$CACHE_ROOT/datasets"
+
+make demo \
+  MODEL_DIR="$CACHE_ROOT/models" \
+  DATASET_DIR="$CACHE_ROOT/datasets"
+```
+
+Hugging Face downloads, the `uv` package cache, and the Ninja build are reused
+when their completed files already exist.
+
+</details>
+
+<details>
+<summary><strong>Use custom input paths</strong></summary>
+
+All input paths and runtime choices are Make variables:
+
+```bash
+make demo \
+  PQ_MODEL=/data/base-pq-4c8b.gguf \
+  FP16_MODEL=/data/Llama-2-7b-chat-hf-f16.gguf \
+  Q2_MODEL=/data/Llama-2-7b-chat-hf.Q2_K.gguf \
+  PQ_CHECKPOINT=/data/best-formal-hard \
+  PPL_DATASET=/data/wikitext-2-raw-v1 \
+  TOKENIZER=/data/llama2-tokenizer \
+  CUDA_DEVICE=0
+```
+
+</details>
 
 <details>
 <summary><strong>Repository layout</strong></summary>

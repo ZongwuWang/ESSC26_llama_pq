@@ -13,7 +13,7 @@ EdgePQ co-designs product quantization and SIMD lookup-table execution to run
 Llama-2-7B decoding directly on commodity CPUs, with no GPU in the decoding
 critical path.
 
-[Why EdgePQ](#why-edgepq) · [Results](#main-results) · [Quick Start](#quick-start) · [Reproduction](#reproduce-the-paper) · [Demo](#demo)
+[Why EdgePQ](#why-edgepq) · [Results](#main-results) · [Quick Start](#quick-start) · [Reproduction](#step-by-step-reproduction) · [Demo](#demo)
 
 </div>
 
@@ -25,17 +25,6 @@ critical path.
   target different matrix shapes and are selected per layer.
 - **Reproducible artifact.** A locked `uv` environment and Make targets cover
   input preparation, correctness checks, throughput, perplexity, and plots.
-
-```mermaid
-flowchart LR
-    A[Llama-2-7B checkpoint] --> B[PQ conversion]
-    B --> C[GGUF + PQ side tensors]
-    C --> D[llama.cpp graph]
-    D --> E1[S1: input-partitioned PQ]
-    D --> E2[S2: output-partitioned PQ]
-    E1 --> F[AVX-512 CPU decode]
-    E2 --> F
-```
 
 ## Main Results
 
@@ -89,17 +78,8 @@ The first run downloads approximately 60 GB of inputs and can take one to three
 hours because it performs the complete PPL evaluation. Later runs reuse the
 environment, models, dataset, build, and existing result CSVs.
 
-For the complete measurement and plot pipeline:
-
-```bash
-make all
-make plot
-```
-
-`make all` always reruns every measurement and produces fresh CSV files;
-`make plot` renders the two PNG charts from those files.
-
-### Reuse a persistent input cache
+<details>
+<summary><strong>Reuse a persistent input cache</strong></summary>
 
 Models and datasets can be shared across checkouts. Prepare a persistent input
 cache once:
@@ -129,6 +109,8 @@ make all \
 not downloaded again when its saved dataset directory exists, `uv` reuses its
 global package cache, and Ninja reuses `build/` in the same checkout.
 
+</details>
+
 ## Requirements
 
 | Workflow | Requirements |
@@ -151,43 +133,27 @@ Do not run `make ppl` or `make pq-ppl` in the CPU-only workflow.
 
 ## Prepare Inputs
 
-The public model repository
-[`ZongwuWang/EdgePQ-4c8b`](https://huggingface.co/ZongwuWang/EdgePQ-4c8b)
-contains:
-
-- `base-pq-4c8b.gguf`, which carries the deployable EdgePQ side tensors (the
-  paper's FP16 baseline remains the separate `Llama-2-7b-chat-hf-f16.gguf`);
-- `Llama-2-7b-chat-hf.Q2_K.gguf`, the exact Q2_K baseline used in the paper;
-- `best-formal-hard/non_pq_state.pt`;
-- all 224 files under `best-formal-hard/pq_states/`;
-- `tokenizer.json`, `tokenizer.model`, and `tokenizer_config.json`.
-
-The prepared inputs are loaded directly: `Llama-2-7b-chat-hf-f16.gguf` for F16,
-`Llama-2-7b-chat-hf.Q2_K.gguf` for Q2_K, and `base-pq-4c8b.gguf` for EdgePQ.
-The artifact does not rename or regenerate these files.
-
 ```bash
 make env
 make prepare-inputs
+make check-inputs
 ```
 
-This downloads the EdgePQ GGUF, Q2_K baseline, checkpoint, and tokenizer from
-[`ZongwuWang/EdgePQ-4c8b`](https://huggingface.co/ZongwuWang/EdgePQ-4c8b),
-the F16 GGUF from
-[`second-state/Llama-2-7B-Chat-GGUF`](https://huggingface.co/second-state/Llama-2-7B-Chat-GGUF),
-and WikiText-2 directly from Hugging Face. Model revisions are pinned in the
-Makefile, and the WikiText-2 revision is pinned in `ppl_gguf_compare.py`.
+`make prepare-inputs` downloads only missing files; `make check-inputs` verifies
+the three GGUFs, all 224 PQ states, tokenizer files, and WikiText-2. Repeated
+runs reuse completed files.
 
-Default paths:
+| Input | Default path | Public source |
+|---|---|---|
+| EdgePQ | `models/base-pq-4c8b.gguf` | [`ZongwuWang/EdgePQ-4c8b`](https://huggingface.co/ZongwuWang/EdgePQ-4c8b) |
+| F16 | `models/Llama-2-7b-chat-hf-f16.gguf` | [`second-state/Llama-2-7B-Chat-GGUF`](https://huggingface.co/second-state/Llama-2-7B-Chat-GGUF) |
+| Q2_K | `models/Llama-2-7b-chat-hf.Q2_K.gguf` | [`ZongwuWang/EdgePQ-4c8b`](https://huggingface.co/ZongwuWang/EdgePQ-4c8b) |
+| Checkpoint and tokenizer | `models/best-formal-hard/`, `models/tokenizer/` | [`ZongwuWang/EdgePQ-4c8b`](https://huggingface.co/ZongwuWang/EdgePQ-4c8b) |
+| WikiText-2 | `datasets/wikitext-2-raw-v1/` | [`Salesforce/wikitext`](https://huggingface.co/datasets/Salesforce/wikitext) |
 
-```text
-models/base-pq-4c8b.gguf
-models/Llama-2-7b-chat-hf-f16.gguf
-models/Llama-2-7b-chat-hf.Q2_K.gguf
-models/best-formal-hard/
-models/tokenizer/
-datasets/wikitext-2-raw-v1/
-```
+Model revisions are pinned in the Makefile, and the WikiText-2 revision is
+pinned in `ppl_gguf_compare.py`. The artifact loads these files directly and
+does not rename or regenerate the baseline GGUFs.
 
 <details>
 <summary><strong>Use custom input paths</strong></summary>
@@ -207,31 +173,22 @@ make all \
 
 </details>
 
-## Build and Validate
+## Step-by-Step Reproduction
 
 ```bash
-make env
 make llama-build
-make check-inputs
 make selftest
 make smoke
+make benchmark
+make ppl
+make pq-ppl
+make plot
 ```
 
 The build includes `llama-perplexity`, `llama-quantize`, `pq-selftest`, and
 `llama-pq-convert`. The root `llama_pq` benchmark runner is built when a target
 needs it. `make smoke` generates eight tokens for each of the three models with
 one measured repetition and does not retain a result file.
-
-## Reproduce the Paper
-
-Run the complete evaluation and then render the results:
-
-```bash
-make all
-make plot
-```
-
-Individual stages are also available:
 
 | Command | Purpose | Main output |
 |---|---|---|
@@ -241,6 +198,7 @@ Individual stages are also available:
 | `make pq-ppl` | Evaluate reconstructed EdgePQ perplexity | Appends to `output/perplexity.csv` |
 | `make plot` | Render both result CSVs | Two PNG charts |
 
+To force every measurement to rerun, use `make all` followed by `make plot`.
 The complete PPL evaluation can take one to three hours. The default Make
 variables match the paper protocol: F16/Q2_K use context 3072 and stride 2048;
 PQ reconstruction uses context and stride 4096. These defaults can be

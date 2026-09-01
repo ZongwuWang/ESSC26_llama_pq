@@ -39,7 +39,7 @@ def prepare_dataset(output: Path) -> None:
     from datasets import load_dataset
 
     if output.exists():
-        print(f"dataset already exists: {output}")
+        print(f"[REUSE] WikiText-2 dataset: {output}")
         return
     output.parent.mkdir(parents=True, exist_ok=True)
     dataset = load_dataset(

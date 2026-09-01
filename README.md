@@ -88,9 +88,12 @@ For a concise, recording-friendly validation after the inputs are cached:
 make demo
 ```
 
-The demo target prints five named stages, reuses `.venv` and `build/`, checks
-every cached input, runs the PQ self-test, and loads all three models for an
-eight-token smoke test. It does not replace the full paper evaluation.
+The demo target is a hands-off recording workflow. It creates or reuses
+`.venv`, downloads only missing inputs, reuses `build/`, runs the PQ self-test,
+and loads all three models for an eight-token smoke test. If complete paper
+CSVs already exist, it reuses them; otherwise it continues with the full
+benchmark and PPL evaluation. It always renders the charts and prints a compact
+throughput/PPL table directly in the terminal.
 
 For the complete measurement and plot pipeline:
 
@@ -134,11 +137,12 @@ not downloaded again when its saved dataset directory exists, `uv` reuses its
 global package cache, and Ninja reuses `build/` in the same checkout.
 
 For a ten-minute recording, run the full `make all` once before recording and
-retain `output/`. During the recording, use `make demo` for the live validation,
-then run `make plot` and inspect the already validated CSVs and charts. If the
-video must show `make all`, start it on screen, explain that PPL takes one to
-three hours, and cut to the completed output rather than implying an instant
-run.
+retain `output/`. During the recording, one `make demo` command performs the
+live validation, reuses the validated CSVs, renders both charts, and prints the
+key numbers. If no CSVs are present, the same command automatically performs
+the full evaluation and may take one to three hours. If the video must show
+`make all`, start it on screen, explain the expected duration, and cut to the
+completed output rather than implying an instant run.
 
 ## Requirements
 

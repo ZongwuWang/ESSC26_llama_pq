@@ -108,47 +108,96 @@ all:
 
 demo:
 	@echo
-	@echo "==> [1/5] Reusing the locked Python environment"
+	@echo "==> [1/7] Creating or reusing the locked Python environment"
 	$(MAKE) env
 	@echo
-	@echo "==> [2/5] Checking cached models, checkpoint, tokenizer, and dataset"
+	@echo "==> [2/7] Detecting cached inputs and downloading only missing files"
+	$(MAKE) prepare-inputs
+	@echo
+	@echo "==> [3/7] Validating models, checkpoint, tokenizer, and dataset"
 	$(MAKE) check-inputs
 	@echo
-	@echo "==> [3/5] Reusing or building the bundled runtime"
+	@echo "==> [4/7] Reusing or building the bundled runtime"
 	$(MAKE) llama-build
 	@echo
-	@echo "==> [4/5] Running the standalone PQ correctness test"
+	@echo "==> [5/7] Running the standalone PQ correctness test"
 	$(MAKE) selftest
 	@echo
-	@echo "==> [5/5] Loading all three models and generating eight tokens each"
+	@echo "==> [6/7] Loading all three models and generating eight tokens each"
 	$(MAKE) smoke
 	@echo
-	@echo "==> Demo check complete. Use 'make all' for the full paper evaluation."
+	@echo "==> [7/7] Producing the paper results and terminal summary"
+	@if test -s "$(THROUGHPUT_OUTPUT)" && test -s "$(PPL_OUTPUT)"; then \
+		echo "[REUSE] $(THROUGHPUT_OUTPUT)"; \
+		echo "[REUSE] $(PPL_OUTPUT)"; \
+	else \
+		echo "[RUN] Cached CSVs are incomplete; continuing with the full paper evaluation"; \
+		$(MAKE) benchmark; \
+		$(MAKE) ppl; \
+		$(MAKE) pq-ppl; \
+	fi
+	$(MAKE) plot
+	@echo
+	@echo "==> Demo complete. Generated artifacts:"
+	@echo "    - $(THROUGHPUT_OUTPUT)"
+	@echo "    - $(PPL_OUTPUT)"
+	@echo "    - $(OUTPUT_DIR)/throughput.png"
+	@echo "    - $(OUTPUT_DIR)/ppl.png"
 
 env: uv.lock pyproject.toml
 	$(UV) sync --frozen
+	@echo "[OK] Python environment: $(VENV)"
 
 prepare-edgepq: env
 	mkdir -p "$(MODEL_DIR)"
-	$(HF) download "$(EDGE_PQ_REPO)" base-pq-4c8b.gguf \
-		--revision "$(EDGE_PQ_REVISION)" --local-dir "$(MODEL_DIR)"
-	$(HF) download "$(EDGE_PQ_REPO)" \
-		--revision "$(EDGE_PQ_REVISION)" \
-		--include "best-formal-hard/*" --local-dir "$(MODEL_DIR)"
-	$(HF) download "$(EDGE_PQ_REPO)" tokenizer.json tokenizer.model tokenizer_config.json \
-		--revision "$(EDGE_PQ_REVISION)" --local-dir "$(MODEL_DIR)/tokenizer"
+	@if test -f "$(PQ_MODEL)"; then \
+		echo "[REUSE] EdgePQ GGUF: $(PQ_MODEL)"; \
+	else \
+		echo "[DOWNLOAD] EdgePQ GGUF from $(EDGE_PQ_REPO)@$(EDGE_PQ_REVISION)"; \
+		$(HF) download "$(EDGE_PQ_REPO)" base-pq-4c8b.gguf \
+			--revision "$(EDGE_PQ_REVISION)" --local-dir "$(MODEL_DIR)"; \
+	fi
+	@count=$$(find "$(PQ_CHECKPOINT)/pq_states" -maxdepth 1 -type f -name '*.pt' 2>/dev/null | wc -l | tr -d ' '); \
+	if test -f "$(PQ_CHECKPOINT)/non_pq_state.pt" && test "$$count" -eq 224; then \
+		echo "[REUSE] EdgePQ checkpoint: $(PQ_CHECKPOINT) (224/224 PQ states)"; \
+	else \
+		echo "[DOWNLOAD] EdgePQ checkpoint from $(EDGE_PQ_REPO)@$(EDGE_PQ_REVISION)"; \
+		$(HF) download "$(EDGE_PQ_REPO)" \
+			--revision "$(EDGE_PQ_REVISION)" \
+			--include "best-formal-hard/*" --local-dir "$(MODEL_DIR)"; \
+	fi
+	@if test -f "$(TOKENIZER)/tokenizer.json" && \
+		test -f "$(TOKENIZER)/tokenizer.model" && \
+		test -f "$(TOKENIZER)/tokenizer_config.json"; then \
+		echo "[REUSE] Llama-2 tokenizer: $(TOKENIZER)"; \
+	else \
+		echo "[DOWNLOAD] Llama-2 tokenizer from $(EDGE_PQ_REPO)@$(EDGE_PQ_REVISION)"; \
+		$(HF) download "$(EDGE_PQ_REPO)" tokenizer.json tokenizer.model tokenizer_config.json \
+			--revision "$(EDGE_PQ_REVISION)" --local-dir "$(TOKENIZER)"; \
+	fi
 
 prepare-baselines: env
 	mkdir -p "$(MODEL_DIR)"
-	$(HF) download "$(FP16_REPO)" "$(FP16_FILE)" \
-		--revision "$(FP16_REVISION)" --local-dir "$(MODEL_DIR)"
-	$(HF) download "$(Q2_REPO)" "$(Q2_FILE)" \
-		--revision "$(Q2_REVISION)" --local-dir "$(MODEL_DIR)"
+	@if test -f "$(FP16_MODEL)"; then \
+		echo "[REUSE] FP16 baseline: $(FP16_MODEL)"; \
+	else \
+		echo "[DOWNLOAD] FP16 baseline from $(FP16_REPO)@$(FP16_REVISION)"; \
+		$(HF) download "$(FP16_REPO)" "$(FP16_FILE)" \
+			--revision "$(FP16_REVISION)" --local-dir "$(MODEL_DIR)"; \
+	fi
+	@if test -f "$(Q2_MODEL)"; then \
+		echo "[REUSE] Q2_K baseline: $(Q2_MODEL)"; \
+	else \
+		echo "[DOWNLOAD] Q2_K baseline from $(Q2_REPO)@$(Q2_REVISION)"; \
+		$(HF) download "$(Q2_REPO)" "$(Q2_FILE)" \
+			--revision "$(Q2_REVISION)" --local-dir "$(MODEL_DIR)"; \
+	fi
 
 prepare-dataset: env
 	$(PYTHON) ppl_gguf_compare.py prepare-dataset --output "$(PPL_DATASET)"
 
 prepare-inputs: prepare-edgepq prepare-baselines prepare-dataset
+	@echo "[OK] Input preparation complete"
 
 check-benchmark-inputs:
 	@test -f "$(FP16_MODEL)" || { echo "missing FP16_MODEL: $(FP16_MODEL)"; exit 1; }
@@ -162,11 +211,15 @@ check-ppl-inputs:
 
 check-pq-ppl-inputs:
 	@test -f "$(PQ_CHECKPOINT)/non_pq_state.pt" || { echo "missing non-PQ state: $(PQ_CHECKPOINT)/non_pq_state.pt"; exit 1; }
-	@test -d "$(PQ_CHECKPOINT)/pq_states" || { echo "missing PQ states: $(PQ_CHECKPOINT)/pq_states"; exit 1; }
-	@test -d "$(TOKENIZER)" || { echo "missing TOKENIZER: $(TOKENIZER)"; exit 1; }
+	@count=$$(find "$(PQ_CHECKPOINT)/pq_states" -maxdepth 1 -type f -name '*.pt' 2>/dev/null | wc -l | tr -d ' '); \
+		test "$$count" -eq 224 || { echo "expected 224 PQ states, found $$count: $(PQ_CHECKPOINT)/pq_states"; exit 1; }
+	@test -f "$(TOKENIZER)/tokenizer.json" || { echo "missing tokenizer.json: $(TOKENIZER)"; exit 1; }
+	@test -f "$(TOKENIZER)/tokenizer.model" || { echo "missing tokenizer.model: $(TOKENIZER)"; exit 1; }
+	@test -f "$(TOKENIZER)/tokenizer_config.json" || { echo "missing tokenizer_config.json: $(TOKENIZER)"; exit 1; }
 	@test -d "$(PPL_DATASET)" || { echo "missing PPL_DATASET: $(PPL_DATASET)"; exit 1; }
 
 check-inputs: check-benchmark-inputs check-ppl-inputs check-pq-ppl-inputs
+	@echo "[OK] All required models, checkpoint files, tokenizer files, and dataset are present"
 
 $(LLAMA_BUILD)/build.ninja: $(LLAMA_SRC)/CMakeLists.txt
 	$(SYSTEM_BUILD_ENV) $(CMAKE) -S "$(LLAMA_SRC)" -B "$(LLAMA_BUILD)" -G Ninja \
@@ -177,12 +230,14 @@ $(LLAMA_BUILD)/build.ninja: $(LLAMA_SRC)/CMakeLists.txt
 llama-build: $(LLAMA_BUILD)/build.ninja
 	$(SYSTEM_BUILD_ENV) $(NINJA) -C "$(LLAMA_BUILD)" \
 		llama llama-perplexity llama-quantize pq-selftest llama-pq-convert -j$$(nproc)
+	@echo "[OK] Runtime and PQ tools: $(LLAMA_BUILD)/bin"
 
 llama_pq: llama_pq.cpp llama-build
 	$(SYSTEM_BUILD_ENV) $(CXX) $(CPPFLAGS) $(LLAMA_LDFLAGS) -o $@ $< $(LLAMA_LDLIBS)
 
 selftest: llama-build
 	"$(LLAMA_BUILD)/bin/pq-selftest"
+	@echo "[OK] PQ correctness self-test passed"
 
 smoke: check-benchmark-inputs llama_pq
 	env -u GGML_NODE_TIMING GGML_PQ_STRIPE=1 OMP_DYNAMIC=FALSE OMP_PROC_BIND=spread OMP_PLACES=cores \
@@ -190,6 +245,7 @@ smoke: check-benchmark-inputs llama_pq
 		--threads "$(AE_THREADS)" --repetitions 1 --warmup 1 \
 		--generations 8 --context "$(AE_CONTEXT)" --numa "$(AE_NUMA)" \
 		--output /dev/null
+	@echo "[OK] F16, Q2_K, and EdgePQ smoke test passed"
 
 benchmark: check-benchmark-inputs llama_pq
 	mkdir -p "$(OUTPUT_DIR)"
@@ -220,6 +276,7 @@ pq-ppl: env check-pq-ppl-inputs
 plot: env
 	$(PYTHON) plot_results.py --throughput "$(THROUGHPUT_OUTPUT)" \
 		--perplexity "$(PPL_OUTPUT)" --output-dir "$(OUTPUT_DIR)"
+	@echo "[OK] Charts rendered in $(OUTPUT_DIR)/"
 
 clean:
 	rm -f llama_pq

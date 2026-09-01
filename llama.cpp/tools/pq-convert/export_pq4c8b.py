@@ -20,6 +20,19 @@ def gguf_name(path: Path) -> str:
     return f"blk.{layer}.{group_name}_{proj_name}.weight"
 
 
+def rope_row_perm(n_out: int, n_head: int) -> np.ndarray:
+    """Undo LlamaModel.permute: map a gguf output row to the HF row.
+
+    LlamaModel.permute (undo_permute=True) stores q/k rows as
+    reshape(n_head, 2, head_dim/2).swapaxes(1,2): gguf row j = d*2 + a holds
+    HF row a*(head_dim/2) + d within each head."""
+    head_dim = n_out // n_head
+    j = np.arange(n_out)
+    within = j % head_dim
+    hf = (j // head_dim) * head_dim + (within % 2) * (head_dim // 2) + within // 2
+    return hf
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("checkpoint")
@@ -52,6 +65,13 @@ def main():
                 cb_out[col:col+4] = (table[s].T * (scales[b] * dscale[col:col+4, None])).astype(np.float16)
         idx_out = np.transpose(codes, (0, 2, 1)).reshape(-1).astype(np.uint8)
         name = gguf_name(src)
+        # q/k output rows are RoPE-permuted in the GGUF layout; remap the
+        # per-output codes and vector scales to match the runtime row order
+        if name.endswith("attn_q.weight") or name.endswith("attn_k.weight"):
+            perm = rope_row_perm(n_out, 32)
+            codes_perm = codes[:, perm, :]
+            idx_out = np.transpose(codes_perm, (0, 2, 1)).reshape(-1).astype(np.uint8)
+            vscale = vscale[perm]
         cb_out.tofile(out / (name + ".cb"))
         idx_out.tofile(out / (name + ".idx"))
         vscale.tofile(out / (name + ".scale"))

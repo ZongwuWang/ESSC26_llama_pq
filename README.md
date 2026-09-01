@@ -13,7 +13,7 @@ EdgePQ co-designs product quantization and SIMD lookup-table execution to run
 Llama-2-7B decoding directly on commodity CPUs, with no GPU in the decoding
 critical path.
 
-[Why EdgePQ](#why-edgepq) · [Results](#main-results) · [Demo](#demo) · [Requirements](#requirements) · [Quick Start](#quick-start) · [Reproduction](#step-by-step-reproduction)
+[Why EdgePQ](#why-edgepq) · [Results](#main-results) · [Demo](#demo) · [Requirements](#requirements) · [Quick Start](#quick-start) · [Reproduction](#step-by-step-reproduction) · [Commands](#command-reference)
 
 </div>
 
@@ -145,12 +145,6 @@ make ppl
 make pq-ppl
 ```
 
-| Command | Purpose | Main output |
-|---|---|---|
-| `make benchmark` | Measure F16, Q2_K, and EdgePQ decode throughput | `output/throughput.csv` |
-| `make ppl` | Evaluate F16 and Q2_K perplexity | `output/perplexity.csv` |
-| `make pq-ppl` | Evaluate reconstructed EdgePQ perplexity | Appends to `output/perplexity.csv` |
-
 The complete PPL evaluation can take one to three hours. The default Make
 variables match the paper protocol: F16/Q2_K use context 3072 and stride 2048;
 PQ reconstruction uses context and stride 4096. These defaults can be
@@ -165,6 +159,31 @@ make plot
 `make plot` prints the measured values and renders the throughput and PPL
 charts. To force every measurement to rerun, use `make all` followed by
 `make plot`.
+
+## Command Reference
+
+`make help` prints the same public target list from the Makefile.
+
+| Command | Purpose | Main output |
+|---|---|---|
+| `make help` | List the public artifact targets | Terminal command list |
+| `make env` | Create or update `.venv` from `uv.lock` | `.venv/` |
+| `make prepare-inputs` | Download only missing models, checkpoint, tokenizer, and WikiText-2 | `models/`, `datasets/` |
+| `make check-inputs` | Validate every required input and all 224 PQ states | Terminal PASS/failure |
+| `make llama-build` | Build llama.cpp, PPL, quantizer, and PQ tools | `build/bin/` |
+| `make selftest` | Compare registered PQ execution with the reference path | Terminal PASS/failure |
+| `make smoke` | Load F16, Q2_K, and EdgePQ and generate eight tokens each | Terminal validation |
+| `make demo` | Run cache-aware end-to-end reproduction, including smoke and plots | CSVs, PNGs, terminal summary |
+| `make benchmark` | Measure F16, Q2_K, and EdgePQ decode throughput | `output/throughput.csv` |
+| `make ppl` | Evaluate F16 and Q2_K perplexity | `output/perplexity.csv` |
+| `make pq-ppl` | Evaluate EdgePQ reconstruction perplexity | Appends to `output/perplexity.csv` |
+| `make all` | Rerun the complete paper evaluation; does not render plots | Both result CSVs |
+| `make plot` | Print and render both result CSVs | Two PNG charts |
+
+The distinction between the two aggregate targets is intentional: `make demo`
+may reuse non-empty CSVs and always runs the smoke test and plotting stage;
+`make all` always reruns the measurements and leaves plotting as a separate
+`make plot` step.
 
 ## Output Files
 

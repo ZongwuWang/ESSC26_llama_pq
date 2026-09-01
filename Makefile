@@ -72,17 +72,18 @@ LLAMA_LDLIBS := -lllama -lggml -lggml-cpu -lggml-base -lpthread -ldl -lm
 
 help:
 	@echo "EdgePQ artifact targets:"
+	@echo "  make help           List the public artifact targets"
 	@echo "  make env            Create the locked Python environment"
 	@echo "  make prepare-inputs Download all public models and WikiText-2"
 	@echo "  make check-inputs   Validate all required external inputs"
 	@echo "  make llama-build    Build llama.cpp, PPL, quantizer, and PQ tools"
 	@echo "  make selftest       Run the PQ correctness self-test"
 	@echo "  make smoke          Run an 8-token three-model smoke test"
-	@echo "  make demo           Run the recording-friendly cached smoke workflow"
+	@echo "  make demo           Run cache-aware end-to-end reproduction"
 	@echo "  make benchmark      Reproduce decode throughput CSV"
 	@echo "  make ppl            Evaluate F16 and Q2_K perplexity"
 	@echo "  make pq-ppl         Evaluate PQ reconstruction perplexity"
-	@echo "  make all            Run the complete paper evaluation"
+	@echo "  make all            Rerun the complete paper evaluation"
 	@echo "  make plot           Render throughput and PPL charts"
 
 

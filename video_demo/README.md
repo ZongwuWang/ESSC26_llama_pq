@@ -1,6 +1,6 @@
 # Video Demo
 
-The final `demo.mp4` will show the complete artifact workflow:
+[`demo.mp4`](demo.mp4) records the complete artifact workflow:
 
 1. fresh clone;
 2. `make env` and input preparation;
@@ -8,5 +8,5 @@ The final `demo.mp4` will show the complete artifact workflow:
 4. `make all` and `make plot`;
 5. inspection of the two CSV files and two charts in `output/`.
 
-Place the compressed ten-minute demonstration at `video_demo/demo.mp4` before
-the artifact release.
+It is included in this repository so that the artifact can be reviewed without
+reconstructing the recording workflow.

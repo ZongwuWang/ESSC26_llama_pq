@@ -60,14 +60,9 @@ into an FP16 Transformers model and evaluating complete, non-overlapping
 ## Demo
 
 The ten-minute walkthrough covers a fresh clone, environment and input setup,
-correctness checks, the full evaluation, and result inspection. The recording
-plan is available in [`video_demo/`](video_demo/).
-
-> [!NOTE]
-> The final `demo.mp4` has not been added yet. After it is uploaded through
-> GitHub, place the generated GitHub asset URL on its own line here to enable
-> inline playback in the README. Keep `video_demo/demo.mp4` as the downloadable
-> artifact copy.
+correctness checks, the full evaluation, and result inspection. Watch or
+download it from [`video_demo/demo.mp4`](video_demo/demo.mp4); the accompanying
+workflow summary is in [`video_demo/`](video_demo/).
 
 ## Quick Start
 

@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import csv
 import math
+import os
 import re
 import subprocess
 import tempfile
@@ -52,12 +53,15 @@ def prepare_dataset(output: Path) -> None:
 
 def run_and_capture(command: list[str]) -> str:
     print("$ " + " ".join(command), flush=True)
+    environment = os.environ.copy()
+    environment.pop("GGML_NODE_TIMING", None)
     process = subprocess.Popen(
         command,
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
         text=True,
         bufsize=1,
+        env=environment,
     )
     lines: list[str] = []
     assert process.stdout is not None
@@ -250,7 +254,13 @@ def evaluate_pq(args: argparse.Namespace) -> None:
             "cpu",
             value=reconstruct_pq_weight(state),
         )
-        print(f"[PQ] reconstructed {index}/224: {path.name}", flush=True)
+        if index == 1 or index % 16 == 0 or index == len(pq_files):
+            percentage = 100.0 * index / len(pq_files)
+            print(
+                f"[EdgePQ setup] reconstructed {index}/{len(pq_files)} "
+                f"layers ({percentage:.0f}%)",
+                flush=True,
+            )
 
     missing = [name for name, parameter in model.named_parameters() if parameter.device.type == "meta"]
     if missing:
@@ -264,6 +274,7 @@ def evaluate_pq(args: argparse.Namespace) -> None:
     total_tokens = 0
     windows = 0
     previous_end = 0
+    total_windows = input_ids.size(1) // args.context
 
     with torch.inference_mode():
         for begin in range(0, input_ids.size(1), args.stride):
@@ -279,11 +290,14 @@ def evaluate_pq(args: argparse.Namespace) -> None:
             total_tokens += target_length
             windows += 1
             previous_end = end
-            print(
-                f"[PQ] windows={windows} tokens={total_tokens} "
-                f"ppl={math.exp(total_nll / total_tokens):.4f}",
-                flush=True,
-            )
+            if windows == 1 or windows % 5 == 0 or windows == total_windows:
+                percentage = 100.0 * windows / total_windows
+                print(
+                    f"[EdgePQ PPL] {windows}/{total_windows} windows "
+                    f"({percentage:.0f}%) tokens={total_tokens} "
+                    f"ppl={math.exp(total_nll / total_tokens):.4f}",
+                    flush=True,
+                )
             if end == input_ids.size(1):
                 break
 

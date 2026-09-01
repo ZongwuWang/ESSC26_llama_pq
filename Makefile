@@ -60,7 +60,7 @@ CPPFLAGS += -I$(LLAMA_SRC)/include -I$(LLAMA_SRC)/ggml/include
 LLAMA_LDFLAGS := -L$(LLAMA_BUILD)/bin -Wl,-rpath,$(abspath $(LLAMA_BUILD)/bin)
 LLAMA_LDLIBS := -lllama -lggml -lggml-cpu -lggml-base -lpthread -ldl -lm
 
-.PHONY: help all env prepare-edgepq prepare-baselines prepare-dataset prepare-inputs \
+.PHONY: help all demo env prepare-edgepq prepare-baselines prepare-dataset prepare-inputs \
 	check-benchmark-inputs check-ppl-inputs check-pq-ppl-inputs check-inputs \
 	llama-build llama_pq selftest smoke benchmark ppl pq-ppl plot clean distclean
 
@@ -72,20 +72,58 @@ help:
 	@echo "  make llama-build    Build llama.cpp, PPL, quantizer, and PQ tools"
 	@echo "  make selftest       Run the PQ correctness self-test"
 	@echo "  make smoke          Run an 8-token three-model smoke test"
+	@echo "  make demo           Run the recording-friendly cached smoke workflow"
 	@echo "  make benchmark      Reproduce decode throughput CSV"
 	@echo "  make ppl            Evaluate F16 and Q2_K perplexity"
 	@echo "  make pq-ppl         Evaluate PQ reconstruction perplexity"
 	@echo "  make all            Run the complete paper evaluation"
 	@echo "  make plot           Render throughput and PPL charts"
 
-all: env
+
+all:
+	@echo
+	@echo "==> [1/7] Creating the locked Python environment"
+	$(MAKE) env
+	@echo
+	@echo "==> [2/7] Preparing public models, checkpoint, tokenizer, and WikiText-2"
 	$(MAKE) prepare-inputs
+	@echo
+	@echo "==> [3/7] Validating every external input"
 	$(MAKE) check-inputs
+	@echo
+	@echo "==> [4/7] Building the bundled llama.cpp and PQ tools"
 	$(MAKE) llama-build
+	@echo
+	@echo "==> [5/7] Running the PQ correctness self-test"
 	$(MAKE) selftest
+	@echo
+	@echo "==> [6/7] Measuring F16, Q2_K, and EdgePQ decode throughput"
 	$(MAKE) benchmark
+	@echo
+	@echo "==> [7/7] Measuring F16, Q2_K, and EdgePQ perplexity"
 	$(MAKE) ppl
 	$(MAKE) pq-ppl
+	@echo
+	@echo "==> Complete: CSV results are in $(OUTPUT_DIR)/; run 'make plot' to render charts."
+
+demo:
+	@echo
+	@echo "==> [1/5] Reusing the locked Python environment"
+	$(MAKE) env
+	@echo
+	@echo "==> [2/5] Checking cached models, checkpoint, tokenizer, and dataset"
+	$(MAKE) check-inputs
+	@echo
+	@echo "==> [3/5] Reusing or building the bundled runtime"
+	$(MAKE) llama-build
+	@echo
+	@echo "==> [4/5] Running the standalone PQ correctness test"
+	$(MAKE) selftest
+	@echo
+	@echo "==> [5/5] Loading all three models and generating eight tokens each"
+	$(MAKE) smoke
+	@echo
+	@echo "==> Demo check complete. Use 'make all' for the full paper evaluation."
 
 env: uv.lock pyproject.toml
 	$(UV) sync --frozen
@@ -147,7 +185,7 @@ selftest: llama-build
 	"$(LLAMA_BUILD)/bin/pq-selftest"
 
 smoke: check-benchmark-inputs llama_pq
-	GGML_PQ_STRIPE=1 OMP_DYNAMIC=FALSE OMP_PROC_BIND=spread OMP_PLACES=cores \
+	env -u GGML_NODE_TIMING GGML_PQ_STRIPE=1 OMP_DYNAMIC=FALSE OMP_PROC_BIND=spread OMP_PLACES=cores \
 		./llama_pq --fp16 "$(FP16_MODEL)" --q2 "$(Q2_MODEL)" --pq "$(PQ_MODEL)" \
 		--threads "$(AE_THREADS)" --repetitions 1 --warmup 1 \
 		--generations 8 --context "$(AE_CONTEXT)" --numa "$(AE_NUMA)" \
@@ -155,7 +193,7 @@ smoke: check-benchmark-inputs llama_pq
 
 benchmark: check-benchmark-inputs llama_pq
 	mkdir -p "$(OUTPUT_DIR)"
-	GGML_PQ_STRIPE=1 OMP_DYNAMIC=FALSE OMP_PROC_BIND=spread OMP_PLACES=cores \
+	env -u GGML_NODE_TIMING GGML_PQ_STRIPE=1 OMP_DYNAMIC=FALSE OMP_PROC_BIND=spread OMP_PLACES=cores \
 		./llama_pq --fp16 "$(FP16_MODEL)" --q2 "$(Q2_MODEL)" --pq "$(PQ_MODEL)" \
 		--threads "$(AE_THREADS)" --repetitions "$(AE_REPETITIONS)" \
 		--warmup "$(AE_WARMUP)" --generations "$(AE_GENERATIONS)" \

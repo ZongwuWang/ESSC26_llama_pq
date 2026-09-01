@@ -82,6 +82,16 @@ make selftest
 make smoke
 ```
 
+For a concise, recording-friendly validation after the inputs are cached:
+
+```bash
+make demo
+```
+
+The demo target prints five named stages, reuses `.venv` and `build/`, checks
+every cached input, runs the PQ self-test, and loads all three models for an
+eight-token smoke test. It does not replace the full paper evaluation.
+
 For the complete measurement and plot pipeline:
 
 ```bash
@@ -92,6 +102,43 @@ make plot
 > [!TIP]
 > `make all` runs the measurements and produces CSV files. `make plot` is a
 > separate step that renders the two PNG charts.
+
+### Reuse a persistent input cache
+
+Models and datasets do not need to be downloaded again for each recording or
+checkout. Prepare a persistent cache once:
+
+```bash
+CACHE_ROOT=/data/edgepq-artifact-cache
+
+make prepare-inputs \
+  MODEL_DIR="$CACHE_ROOT/models" \
+  DATASET_DIR="$CACHE_ROOT/datasets"
+```
+
+Then pass the same directories to any target:
+
+```bash
+make demo \
+  MODEL_DIR="$CACHE_ROOT/models" \
+  DATASET_DIR="$CACHE_ROOT/datasets"
+
+make all \
+  MODEL_DIR="$CACHE_ROOT/models" \
+  DATASET_DIR="$CACHE_ROOT/datasets" \
+  CUDA_DEVICE=0
+```
+
+`hf download` reuses the local-dir metadata and completed files, WikiText-2 is
+not downloaded again when its saved dataset directory exists, `uv` reuses its
+global package cache, and Ninja reuses `build/` in the same checkout.
+
+For a ten-minute recording, run the full `make all` once before recording and
+retain `output/`. During the recording, use `make demo` for the live validation,
+then run `make plot` and inspect the already validated CSVs and charts. If the
+video must show `make all`, start it on screen, explain that PPL takes one to
+three hours, and cut to the completed output rather than implying an instant
+run.
 
 ## Requirements
 

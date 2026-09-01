@@ -17,11 +17,13 @@ MODEL_DIR ?= models
 DATASET_DIR ?= datasets
 
 EDGE_PQ_REPO ?= ZongwuWang/EdgePQ-4c8b
-EDGE_PQ_REVISION ?= 574ece53e87a10c12a2ea299996cf7622989634d
-Q2_REPO ?= second-state/Llama-2-7B-Chat-GGUF
-Q2_REVISION ?= 064fe43ea8c1e1f93477ef4a170bdc2b244ef02c
+EDGE_PQ_REVISION ?= 9123bbce4024cdc1ee4ffea79e60b9bfe50672c8
+FP16_REPO ?= second-state/Llama-2-7B-Chat-GGUF
+FP16_REVISION ?= 064fe43ea8c1e1f93477ef4a170bdc2b244ef02c
+Q2_REPO ?= $(EDGE_PQ_REPO)
+Q2_REVISION ?= $(EDGE_PQ_REVISION)
 FP16_FILE ?= Llama-2-7b-chat-hf-f16.gguf
-Q2_FILE ?= Llama-2-7b-chat-hf-Q2_K.gguf
+Q2_FILE ?= Llama-2-7b-chat-hf.Q2_K.gguf
 PQ_MODEL ?= $(MODEL_DIR)/base-pq-4c8b.gguf
 FP16_MODEL ?= $(MODEL_DIR)/$(FP16_FILE)
 Q2_MODEL ?= $(MODEL_DIR)/$(Q2_FILE)
@@ -100,7 +102,9 @@ prepare-edgepq: env
 
 prepare-baselines: env
 	mkdir -p "$(MODEL_DIR)"
-	$(HF) download "$(Q2_REPO)" "$(FP16_FILE)" "$(Q2_FILE)" \
+	$(HF) download "$(FP16_REPO)" "$(FP16_FILE)" \
+		--revision "$(FP16_REVISION)" --local-dir "$(MODEL_DIR)"
+	$(HF) download "$(Q2_REPO)" "$(Q2_FILE)" \
 		--revision "$(Q2_REVISION)" --local-dir "$(MODEL_DIR)"
 
 prepare-dataset: env

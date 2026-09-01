@@ -158,7 +158,7 @@ def llama2_7b_config():
         hidden_act="silu",
         max_position_embeddings=4096,
         initializer_range=0.02,
-        rms_norm_eps=1e-6,
+        rms_norm_eps=1e-5,
         use_cache=False,
         pad_token_id=None,
         bos_token_id=1,
@@ -227,6 +227,8 @@ def evaluate_pq(args: argparse.Namespace) -> None:
         raise SystemExit(f"incomplete PQ checkpoint: {checkpoint}")
     if not dataset.is_dir():
         raise SystemExit(f"dataset does not exist: {dataset}")
+    if args.stride != args.context:
+        raise SystemExit("the paper PQ protocol requires stride == context")
 
     tokenizer = AutoTokenizer.from_pretrained(args.tokenizer, use_fast=True)
     with init_empty_weights():
@@ -257,28 +259,36 @@ def evaluate_pq(args: argparse.Namespace) -> None:
     device = torch.device(args.device)
     model.to(device)
     model.eval()
-    text = load_test_text(dataset)
-    input_ids = tokenizer(text, return_tensors="pt")["input_ids"]
+    input_ids = tokenizer(load_test_text(dataset), return_tensors="pt")["input_ids"]
     total_nll = 0.0
     total_tokens = 0
+    windows = 0
     previous_end = 0
 
     with torch.inference_mode():
         for begin in range(0, input_ids.size(1), args.stride):
             end = min(begin + args.context, input_ids.size(1))
             target_length = end - previous_end
-            if target_length <= 0:
-                break
+            if target_length != args.context:
+                continue
             tokens = input_ids[:, begin:end].to(device)
             labels = tokens.clone()
             labels[:, :-target_length] = -100
             loss = model(tokens, labels=labels).loss
             total_nll += float(loss) * target_length
             total_tokens += target_length
+            windows += 1
             previous_end = end
-            print(f"[PQ] tokens={total_tokens} ppl={math.exp(total_nll / total_tokens):.4f}", flush=True)
+            print(
+                f"[PQ] windows={windows} tokens={total_tokens} "
+                f"ppl={math.exp(total_nll / total_tokens):.4f}",
+                flush=True,
+            )
             if end == input_ids.size(1):
                 break
+
+    if not total_tokens:
+        raise RuntimeError("no complete PQ PPL window was produced")
 
     ppl = math.exp(total_nll / total_tokens)
     rows = [{
@@ -291,9 +301,9 @@ def evaluate_pq(args: argparse.Namespace) -> None:
         "threads": "NA",
         "numa": "NA",
         "ppl": f"{ppl:.4f}",
-        "method": "online PQ-to-FP16 reconstruction",
+        "method": "complete-window PQ-to-FP16 reconstruction",
     }]
-    print(f"[EdgePQ] PPL = {ppl:.4f}")
+    print(f"[EdgePQ] windows={windows} tokens={total_tokens} PPL = {ppl:.4f}")
     write_rows(Path(args.output), rows, append=args.append)
 
 

@@ -225,18 +225,20 @@ static std::vector<Measurement> evaluate_model(const std::string & name, const s
     model_params.pq_ds = 4;
     model_params.pq_mode = 0;
 
-    std::cout << "[AE] loading " << name << ": " << path << '\n';
+    std::cout << "[AE] loading " << name << ": " << path << '\n' << std::flush;
     llama_model * model = llama_model_load_from_file(path.c_str(), model_params);
     if (model == nullptr) {
         throw std::runtime_error("failed to load model: " + path);
     }
+    std::cout << "[AE] loaded " << name << '\n' << std::flush;
 
     std::vector<Measurement> results;
     for (const int n_gen : options.generations) {
         const std::vector<double> samples = run_generation(model, options, n_gen, 0x4c4c4d41ULL);
         for (size_t repetition = 0; repetition < samples.size(); ++repetition) {
             std::cout << "[AE] " << name << " tg" << n_gen << " run " << (repetition + 1)
-                      << ": " << std::fixed << std::setprecision(2) << samples[repetition] << " tokens/s\n";
+                      << ": " << std::fixed << std::setprecision(2) << samples[repetition]
+                      << " tokens/s\n" << std::flush;
         }
         const double mean = std::accumulate(samples.begin(), samples.end(), 0.0) / samples.size();
         double variance = 0.0;

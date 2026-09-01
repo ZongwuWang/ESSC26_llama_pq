@@ -5,6 +5,7 @@ CC := /usr/bin/gcc
 CMAKE ?= cmake
 NINJA ?= ninja
 UV ?= uv
+CUDACXX ?=
 
 VENV ?= .venv
 PYTHON := $(VENV)/bin/python
@@ -50,6 +51,11 @@ PPL_NUMA ?= distribute
 
 THROUGHPUT_OUTPUT := $(OUTPUT_DIR)/throughput.csv
 PPL_OUTPUT := $(OUTPUT_DIR)/perplexity.csv
+
+ifeq ($(strip $(CUDACXX)),)
+CUDACXX := $(firstword $(wildcard /usr/local/cuda/bin/nvcc /usr/local/cuda-12.4/bin/nvcc /usr/local/cuda-12.9/bin/nvcc))
+endif
+CUDA_COMPILER_ARG := $(if $(CUDACXX),-DCMAKE_CUDA_COMPILER="$(CUDACXX)",)
 
 SYSTEM_BUILD_ENV := env -u CFLAGS -u CXXFLAGS -u LDFLAGS \
 	-u LD_LIBRARY_PATH -u LIBRARY_PATH -u CPATH \
@@ -225,7 +231,7 @@ $(LLAMA_BUILD)/build.ninja: $(LLAMA_SRC)/CMakeLists.txt
 	$(SYSTEM_BUILD_ENV) $(CMAKE) -S "$(LLAMA_SRC)" -B "$(LLAMA_BUILD)" -G Ninja \
 		-DCMAKE_BUILD_TYPE=Release -DGGML_NATIVE=ON -DGGML_CUDA=$(GGML_CUDA) \
 		-DLLAMA_BUILD_TOOLS=ON -DLLAMA_BUILD_MTMD=OFF -DLLAMA_BUILD_UI=OFF \
-		-DLLAMA_OPENSSL=OFF -DCMAKE_C_COMPILER="$(CC)" -DCMAKE_CXX_COMPILER="$(CXX)"
+		-DLLAMA_OPENSSL=OFF -DCMAKE_C_COMPILER="$(CC)" -DCMAKE_CXX_COMPILER="$(CXX)" $(CUDA_COMPILER_ARG)
 
 llama-build: $(LLAMA_BUILD)/build.ninja
 	$(SYSTEM_BUILD_ENV) $(NINJA) -C "$(LLAMA_BUILD)" \

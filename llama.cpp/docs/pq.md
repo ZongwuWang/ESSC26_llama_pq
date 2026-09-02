@@ -282,3 +282,28 @@ HF-to-GGUF conversion. Query and key head counts are read separately from the
 model configuration so grouped-query attention is handled correctly. Decode
 uses the S1 AVX-512 LUT kernel with `ds=4`; prefill continues to use the
 original F16 tensors.
+
+## Interactive text generation
+
+Build and launch the lightweight text frontend through the artifact Makefile:
+
+```bash
+make chat GGML_CUDA=OFF
+```
+
+The resulting `build/bin/llama-pq-chat` reads `tokenizer.chat_template` from
+the GGUF. In the default `auto` mode, a model with an embedded template uses
+llama.cpp's chat-template API and retains system/user/assistant message
+history. A model without a template uses independent completion prompts and
+does not receive synthetic role markers.
+
+The mode can be overridden for diagnostics or for another compatible GGUF:
+
+```bash
+make chat GGML_CUDA=OFF CHAT_MODE=completion
+make chat GGML_CUDA=OFF CHAT_MODEL=/data/chat-edgepq.gguf CHAT_MODE=auto
+```
+
+`CHAT_MODE=chat` fails if the GGUF has no embedded template. The terminal
+prints the selected mode and Prompt/Generation Token/s. Use `/clear` to reset
+message history and `/exit` to quit.

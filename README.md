@@ -97,6 +97,32 @@ renders both charts.
 The first run downloads approximately 60 GB and can take one to three hours.
 Later runs reuse the environment, inputs, build, and existing result CSVs.
 
+### Interactive Generation
+
+```bash
+make chat GGML_CUDA=OFF
+```
+
+The runner inspects the GGUF metadata automatically. A model containing
+`tokenizer.chat_template` uses llama.cpp's chat-template API and retains the
+standard system/user/assistant message history. A model without that metadata,
+including the current base EdgePQ model, uses completion mode: each entered
+prompt is an independent continuation and no synthetic chat format is added.
+The selected mode and Prompt/Generation tokens per second are printed in the
+terminal. Use `/clear` to clear chat history and `/exit` to stop.
+
+Override the automatic decision or select another compatible GGUF when needed:
+
+```bash
+make chat GGML_CUDA=OFF CHAT_MODE=completion
+make chat GGML_CUDA=OFF CHAT_MODEL=/data/chat-edgepq.gguf CHAT_MODE=auto
+```
+
+`CHAT_MODE` accepts `auto`, `chat`, or `completion`. Forced chat mode fails
+clearly if the GGUF has no embedded chat template. Other useful overrides are
+`CHAT_THREADS`, `CHAT_CPU_RANGE`, `CHAT_CONTEXT`, `CHAT_MAX_TOKENS`, and
+`CHAT_SYSTEM`.
+
 ## Step-by-Step Reproduction
 
 ### 1. Environment and Inputs
@@ -173,6 +199,7 @@ charts. To force every measurement to rerun, use `make all` followed by
 | `make llama-build` | Build llama.cpp, PPL, quantizer, and PQ tools | `build/bin/` |
 | `make selftest` | Compare registered PQ execution with the reference path | Terminal PASS/failure |
 | `make smoke` | Load F16, Q2_K, and EdgePQ and generate eight tokens each | Terminal validation |
+| `make chat` | Auto-detect Chat or completion mode and start interactive generation | Terminal conversation and Token/s |
 | `make demo` | Run cache-aware end-to-end reproduction, including smoke and plots | CSVs, PNGs, terminal summary |
 | `make benchmark` | Measure F16, Q2_K, and EdgePQ decode throughput | `output/throughput.csv` |
 | `make ppl` | Evaluate F16 and Q2_K perplexity | `output/perplexity.csv` |
@@ -251,6 +278,7 @@ ESSC26_llama_pq/
 |-- ppl_gguf_compare.py   # dataset preparation and PPL evaluation
 |-- plot_results.py       # throughput and PPL charts
 |-- llama.cpp/            # vendored, PQ-extended llama.cpp
+|   |-- tools/pq-chat/    # auto-detected Chat/completion frontend
 |   |-- tools/pq-convert/ # checkpoint exporter
 |   `-- tools/pq-selftest/# correctness self-test
 |-- video_demo/           # recorded artifact walkthrough

@@ -44,6 +44,14 @@ AE_GENERATIONS ?= 128,512
 AE_CONTEXT ?= 2048
 AE_NUMA ?= distribute
 
+CHAT_MODEL ?= $(PQ_MODEL)
+CHAT_MODE ?= auto
+CHAT_THREADS ?= $(AE_THREADS)
+CHAT_CPU_RANGE ?= 0-59
+CHAT_CONTEXT ?= 4096
+CHAT_MAX_TOKENS ?= 256
+CHAT_SYSTEM ?=
+
 GGUF_PPL_CONTEXT ?= 3072
 GGUF_PPL_STRIDE ?= 2048
 PQ_PPL_CONTEXT ?= 4096
@@ -70,7 +78,8 @@ LLAMA_LDLIBS := -lllama -lggml -lggml-cpu -lggml-base -lpthread -ldl -lm
 
 .PHONY: help all demo env prepare-edgepq prepare-baselines prepare-dataset prepare-inputs \
 	check-benchmark-inputs check-ppl-inputs check-pq-ppl-inputs check-inputs \
-	llama-build llama_pq selftest smoke benchmark ppl pq-ppl plot clean distclean
+	llama-build llama_pq prepare-chat-model chat selftest smoke benchmark ppl pq-ppl \
+	plot clean distclean
 
 help:
 	@echo "EdgePQ artifact targets:"
@@ -81,6 +90,7 @@ help:
 	@echo "  make llama-build    Build llama.cpp, PPL, quantizer, and PQ tools"
 	@echo "  make selftest       Run the PQ correctness self-test"
 	@echo "  make smoke          Run an 8-token three-model smoke test"
+	@echo "  make chat           Auto-detect Chat vs completion mode from the GGUF"
 	@echo "  make demo           Run cache-aware end-to-end reproduction"
 	@echo "  make benchmark      Reproduce decode throughput CSV"
 	@echo "  make ppl            Evaluate F16 and Q2_K perplexity"
@@ -268,11 +278,30 @@ $(LLAMA_BUILD)/build.ninja: $(LLAMA_SRC)/CMakeLists.txt
 
 llama-build: $(LLAMA_BUILD)/build.ninja
 	$(SYSTEM_BUILD_ENV) $(NINJA) -C "$(LLAMA_BUILD)" \
-		llama llama-perplexity llama-quantize pq-selftest llama-pq-convert -j$$(nproc)
+		llama llama-perplexity llama-quantize pq-selftest llama-pq-chat llama-pq-convert -j$$(nproc)
 	@echo "[OK] Runtime and PQ tools: $(LLAMA_BUILD)/bin"
 
 llama_pq: llama_pq.cpp llama-build
 	$(SYSTEM_BUILD_ENV) $(CXX) $(CPPFLAGS) $(LLAMA_LDFLAGS) -o $@ $< $(LLAMA_LDLIBS)
+
+prepare-chat-model:
+	@if test "$(CHAT_MODEL)" = "$(PQ_MODEL)"; then \
+		$(MAKE) prepare-edgepq; \
+	elif test -f "$(CHAT_MODEL)"; then \
+		echo "[REUSE] User-provided chat model: $(CHAT_MODEL)"; \
+	else \
+		echo "[ERROR] CHAT_MODEL does not exist: $(CHAT_MODEL)" >&2; \
+		exit 1; \
+	fi
+
+chat: prepare-chat-model llama-build
+	env -u GGML_NODE_TIMING -u GGML_PQ_DISABLE_ATTN -u GGML_PQ_DISABLE_FFN \
+		-u GGML_PQ_DISABLE_S1 -u GGML_PQ_DISABLE_S2 -u GGML_PQ_NO_FUSE -u GGML_PQ_NO_QKV \
+		GGML_PQ_STRIPE=1 OMP_DYNAMIC=FALSE OMP_PROC_BIND=spread OMP_PLACES=cores \
+		taskset -c "$(CHAT_CPU_RANGE)" "$(LLAMA_BUILD)/bin/llama-pq-chat" \
+		--model "$(CHAT_MODEL)" --mode "$(CHAT_MODE)" \
+		--threads "$(CHAT_THREADS)" --ctx-size "$(CHAT_CONTEXT)" \
+		--max-tokens "$(CHAT_MAX_TOKENS)" --system "$(CHAT_SYSTEM)"
 
 selftest: llama-build
 	"$(LLAMA_BUILD)/bin/pq-selftest"

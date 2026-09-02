@@ -3072,14 +3072,19 @@ static struct ggml_op_acc_state {
     uint64_t barrier_total_us;
     struct ggml_op_acc g_op_acc[GGML_OP_COUNT];
 } g_node_timing;
-static int g_node_timing_on = -1;
+static atomic_int g_node_timing_on = -1;
 static int graphs_seen_total = 0;
 
 static int ggml_node_timing_enabled(void) {
-    if (g_node_timing_on < 0) {
-        g_node_timing_on = getenv("GGML_NODE_TIMING") ? 1 : 0;
+    int enabled = atomic_load_explicit(&g_node_timing_on, memory_order_relaxed);
+    if (enabled < 0) {
+        const int configured = getenv("GGML_NODE_TIMING") ? 1 : 0;
+        atomic_compare_exchange_strong_explicit(
+            &g_node_timing_on, &enabled, configured,
+            memory_order_relaxed, memory_order_relaxed);
+        enabled = atomic_load_explicit(&g_node_timing_on, memory_order_relaxed);
     }
-    return g_node_timing_on;
+    return enabled;
 }
 
 static const char * ggml_op_name_short(enum ggml_op op) {
@@ -3142,6 +3147,7 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
         /*.threadpool =*/ tp,
         /*.use_ref    =*/ cplan->use_ref,
     };
+    const int node_timing_on = ggml_node_timing_enabled();
 
 #ifdef GGML_USE_OPENMP
     GGML_PRINT_DEBUG("thread #%d compute-start cplan %p\n", state->ith, (const void *)cplan);
@@ -3171,14 +3177,14 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
 
         // TODO: move fused-op detection into ggml_graph_plan so fusion decisions are made once at planning time
         // Try fused ops, fall back to normal compute
-        const uint64_t t_busy0 = g_node_timing_on ? ggml_time_us() : 0;
+        const uint64_t t_busy0 = node_timing_on ? ggml_time_us() : 0;
         const int n_fused = ggml_cpu_try_fuse_ops(cgraph, node_n, &params, cplan);
         if (n_fused > 0) {
             node_n += n_fused;
         } else {
             ggml_compute_forward(&params, node);
         }
-        const uint64_t t_busy1 = g_node_timing_on ? ggml_time_us() : 0;
+        const uint64_t t_busy1 = node_timing_on ? ggml_time_us() : 0;
 
         if (state->ith == 0 && cplan->abort_callback &&
                 cplan->abort_callback(cplan->abort_callback_data)) {
@@ -3187,7 +3193,7 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
         }
 
         if (node_n + 1 < cgraph->n_nodes) {
-            if (g_node_timing_on && state->ith == 0) {
+            if (node_timing_on && state->ith == 0) {
                 g_node_timing.g_op_acc[node->op].count++;
                 g_node_timing.g_op_acc[node->op].busy_us += t_busy1 - t_busy0;
                 if (node->op == GGML_OP_MUL_MAT && graphs_seen_total > 8 && t_busy1 > t_busy0) {
@@ -3201,13 +3207,13 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
             } else {
                 ggml_barrier(state->threadpool);
             }
-        } else if (g_node_timing_on && state->ith == 0) {
+        } else if (node_timing_on && state->ith == 0) {
             g_node_timing.g_op_acc[node->op].count++;
             g_node_timing.g_op_acc[node->op].busy_us += t_busy1 - t_busy0;
         }
     }
 
-    if (g_node_timing_on && state->ith == 0) {
+    if (node_timing_on && state->ith == 0) {
         static int graphs_seen = 0;
         graphs_seen_total++;
         if (++graphs_seen >= 32) {

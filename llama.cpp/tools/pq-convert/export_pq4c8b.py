@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Export TFLOP pq-4c8b states into llama-pq-convert side buffers."""
 import argparse
-import os
+import json
 from pathlib import Path
 import numpy as np
 import torch
@@ -20,11 +20,57 @@ def gguf_name(path: Path) -> str:
     return f"blk.{layer}.{group_name}_{proj_name}.weight"
 
 
+def load_attention_head_counts(model_config: Path) -> tuple[int, int]:
+    config_path = (
+        model_config / "config.json" if model_config.is_dir() else model_config
+    )
+    with config_path.open(encoding="utf-8") as handle:
+        config = json.load(handle)
+    n_head = int(config["num_attention_heads"])
+    n_head_kv = int(config.get("num_key_value_heads", n_head))
+    if n_head <= 0 or n_head_kv <= 0:
+        raise ValueError(f"invalid attention head counts in {config_path}")
+    return n_head, n_head_kv
+
+
+def llama_rope_row_permutation(n_out: int, n_head: int) -> np.ndarray:
+    """Map canonical GGUF Q/K output rows to their source HF rows."""
+    if n_out % n_head:
+        raise ValueError(f"n_out={n_out} is not divisible by n_head={n_head}")
+    head_dim = n_out // n_head
+    if head_dim % 2 != 0:
+        raise ValueError(f"head_dim={head_dim} must be even for RoPE permutation")
+    gguf_row = np.arange(n_out)
+    within_head = gguf_row % head_dim
+    return (
+        (gguf_row // head_dim) * head_dim
+        + (within_head % 2) * (head_dim // 2)
+        + within_head // 2
+    )
+
+
+def permute_output_axis(
+    values: np.ndarray, permutation: np.ndarray, axis: int
+) -> np.ndarray:
+    if values.shape[axis] != permutation.size:
+        raise ValueError(
+            f"output axis has {values.shape[axis]} rows, expected {permutation.size}"
+        )
+    return np.take(values, permutation, axis=axis)
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("checkpoint")
     ap.add_argument("out_dir")
+    ap.add_argument(
+        "--model-config",
+        type=Path,
+        required=True,
+        help="Hugging Face model directory or config.json used for Q/K head counts",
+    )
     args = ap.parse_args()
+    n_head, n_head_kv = load_attention_head_counts(args.model_config)
     out = Path(args.out_dir); out.mkdir(parents=True, exist_ok=True)
     root = Path(args.checkpoint) / "pq_states"
     count = 0
@@ -50,8 +96,24 @@ def main():
             for s in range(sub):
                 col = (b * sub + s) * 4
                 cb_out[col:col+4] = (table[s].T * (scales[b] * dscale[col:col+4, None])).astype(np.float16)
-        idx_out = np.transpose(codes, (0, 2, 1)).reshape(-1).astype(np.uint8)
         name = gguf_name(src)
+        # Side tensors must use the canonical layout of their final GGUF
+        # weight. This is easy to miss because dense HF-to-GGUF conversion
+        # and checkpoint-side export are separate pipelines: tensor shapes
+        # and byte counts still look valid even when their row orders differ.
+        # Llama conversion RoPE-permutes Q/K output rows, so every PQ value
+        # indexed by output row must undergo the identical transform. If it
+        # does not, the runtime pairs each GGUF Q/K row with another HF row's
+        # code and scale, corrupting attention while the kernel itself still
+        # passes isolated layout and shape checks.
+        if name.endswith("attn_q.weight") or name.endswith("attn_k.weight"):
+            projection_heads = (
+                n_head if name.endswith("attn_q.weight") else n_head_kv
+            )
+            permutation = llama_rope_row_permutation(n_out, projection_heads)
+            codes = permute_output_axis(codes, permutation, axis=1)
+            vscale = permute_output_axis(vscale, permutation, axis=0)
+        idx_out = np.transpose(codes, (0, 2, 1)).reshape(-1).astype(np.uint8)
         cb_out.tofile(out / (name + ".cb"))
         idx_out.tofile(out / (name + ".idx"))
         vscale.tofile(out / (name + ".scale"))

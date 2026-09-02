@@ -268,11 +268,17 @@ TFLOP `pq-4c8b` checkpoints can be exported into precomputed GGUF side tensors:
 
 ```bash
 env -u LD_LIBRARY_PATH python3 tools/pq-convert/export_pq4c8b.py \
-  ../TFLOP/best-formal-hard /tmp/pq4c8b-side
+  ../TFLOP/best-formal-hard /tmp/pq4c8b-side \
+  --model-config ../Llama-2-7b-hf/config.json
 llama-pq-convert base-pq.gguf base-pq-4c8b.gguf \
   --pq4c8b-dir /tmp/pq4c8b-side
 ```
 
 The exporter folds block and dimension scales into the FP16 codebook and keeps
-per-output vector scales as `pq_row_scale`. Decode uses the S1 AVX-512 LUT
-kernel with `ds=4`; prefill continues to use the original F16 tensors.
+per-output vector scales as `pq_row_scale`. Side tensors are written in the
+canonical row order of the final GGUF weight. In particular, Q/K codes and
+per-output scales receive the same Llama RoPE row permutation as the dense
+HF-to-GGUF conversion. Query and key head counts are read separately from the
+model configuration so grouped-query attention is handled correctly. Decode
+uses the S1 AVX-512 LUT kernel with `ds=4`; prefill continues to use the
+original F16 tensors.

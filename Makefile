@@ -18,7 +18,8 @@ MODEL_DIR ?= models
 DATASET_DIR ?= datasets
 
 EDGE_PQ_REPO ?= ZongwuWang/EdgePQ-4c8b
-EDGE_PQ_REVISION ?= 9123bbce4024cdc1ee4ffea79e60b9bfe50672c8
+EDGE_PQ_REVISION ?= e0d5a4e1bc91370f866d6bc729ed24a602666029
+EDGE_PQ_SHA256 ?= 189c984206891d84076581cf6b2bd3a11864790c20e6a9aa27a4919e31b69bdf
 FP16_REPO ?= second-state/Llama-2-7B-Chat-GGUF
 FP16_REVISION ?= 064fe43ea8c1e1f93477ef4a170bdc2b244ef02c
 Q2_REPO ?= $(EDGE_PQ_REPO)
@@ -26,6 +27,7 @@ Q2_REVISION ?= $(EDGE_PQ_REVISION)
 FP16_FILE ?= Llama-2-7b-chat-hf-f16.gguf
 Q2_FILE ?= Llama-2-7b-chat-hf.Q2_K.gguf
 PQ_MODEL ?= $(MODEL_DIR)/base-pq-4c8b.gguf
+PQ_MODEL_VERIFY_STAMP ?= $(PQ_MODEL).verified
 FP16_MODEL ?= $(MODEL_DIR)/$(FP16_FILE)
 Q2_MODEL ?= $(MODEL_DIR)/$(Q2_FILE)
 PQ_CHECKPOINT ?= $(MODEL_DIR)/best-formal-hard
@@ -157,12 +159,42 @@ env: uv.lock pyproject.toml
 
 prepare-edgepq: env
 	mkdir -p "$(MODEL_DIR)"
-	@if test -f "$(PQ_MODEL)"; then \
-		echo "[REUSE] EdgePQ GGUF: $(PQ_MODEL)"; \
+	@set -eu; \
+	model="$(PQ_MODEL)"; \
+	stamp="$(PQ_MODEL_VERIFY_STAMP)"; \
+	expected="$(EDGE_PQ_SHA256)"; \
+	test -n "$$expected" || { echo "[ERROR] EDGE_PQ_SHA256 is empty" >&2; exit 1; }; \
+	verify_model() { \
+		if test -f "$$stamp" && test "$$stamp" -nt "$$model"; then \
+			cached=$$(cat "$$stamp"); \
+			if test "$$cached" = "$$expected"; then \
+				return 0; \
+			fi; \
+			echo "[STALE] EdgePQ GGUF verification stamp targets a different SHA-256" >&2; \
+			echo "        required: $$expected" >&2; \
+			echo "        cached:   $$cached" >&2; \
+			return 1; \
+		fi; \
+		echo "[CHECK] Verifying EdgePQ GGUF SHA-256: $$model"; \
+		actual=$$(sha256sum "$$model" | awk '{print $$1}'); \
+		test "$$actual" = "$$expected" || { \
+			echo "[STALE] EdgePQ GGUF SHA-256 mismatch" >&2; \
+			echo "        expected: $$expected" >&2; \
+			echo "        actual:   $$actual" >&2; \
+			return 1; \
+		}; \
+		printf '%s\n' "$$expected" > "$$stamp"; \
+	}; \
+	if test -f "$$model" && verify_model; then \
+		echo "[REUSE] Verified EdgePQ GGUF: $$model"; \
 	else \
+		rm -f "$$stamp"; \
 		echo "[DOWNLOAD] EdgePQ GGUF from $(EDGE_PQ_REPO)@$(EDGE_PQ_REVISION)"; \
 		$(HF) download "$(EDGE_PQ_REPO)" base-pq-4c8b.gguf \
-			--revision "$(EDGE_PQ_REVISION)" --local-dir "$(MODEL_DIR)"; \
+			--revision "$(EDGE_PQ_REVISION)" --local-dir "$(MODEL_DIR)" --force-download; \
+		test -f "$$model" || { echo "[ERROR] EdgePQ download did not create $$model" >&2; exit 1; }; \
+		verify_model || { echo "[ERROR] Downloaded EdgePQ GGUF failed verification" >&2; exit 1; }; \
+		echo "[OK] Downloaded and verified EdgePQ GGUF: $$model"; \
 	fi
 	@count=$$(find "$(PQ_CHECKPOINT)/pq_states" -maxdepth 1 -type f -name '*.pt' 2>/dev/null | wc -l | tr -d ' '); \
 	if test -f "$(PQ_CHECKPOINT)/non_pq_state.pt" && test "$$count" -eq 224; then \

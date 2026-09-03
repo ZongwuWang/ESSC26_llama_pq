@@ -1,10 +1,3 @@
-
-
-
-
-https://github.com/user-attachments/assets/fdb0e12c-c5cb-42de-a32a-d360a3e8d43d
-
-
 <div align="center">
 
 <h1>EdgePQ</h1>
@@ -28,43 +21,50 @@ critical path.
 
 - **Two-bit CPU-native decoding.** Learned non-uniform codebooks reduce the
   weight stream while keeping the token-generation path on the CPU.
-- **Dual-mode PQ GEMV.** Input-partitioned S1 and output-partitioned S2 layouts
-  target different matrix shapes and are selected per layer.
+- **Dual-mode PQ GEMV runtime.** The implementation supports input-partitioned
+  S1 and output-partitioned S2 layouts for different matrix shapes.
 - **Reproducible artifact.** A locked `uv` environment and Make targets cover
   input preparation, correctness checks, throughput, perplexity, and plots.
 
 ## Main Results
 
-The paper reports the following results with 60 CPU threads on the evaluation
-platform described in the paper:
+The released artifact uses the following reference results with 60 CPU threads
+on the evaluation platform described in the paper:
 
 | Model | TG128 (tok/s) | TG512 (tok/s) | WikiText-2 PPL |
 |---|---:|---:|---:|
 | F16 | 25.24 ± 0.38 | 24.10 ± 0.77 | 6.09 |
 | Q2_K | 38.11 ± 0.89 | 34.24 ± 0.37 | 7.75 |
-| **EdgePQ** | **56.50 ± 0.64** | **53.04 ± 0.58** | **6.33** |
+| **EdgePQ** | **56.50 ± 0.64** | **53.04 ± 0.58** | **6.34** |
 
 EdgePQ is 2.24×/2.20× faster than F16 and 48.3%/54.9% faster than Q2_K at
-TG128/TG512. Its PPL is 18.3% lower than Q2_K and within 3.9% of F16. The
-unrounded reproduced PPL values are 6.0944 (F16), 7.7528 (Q2_K), and 6.3286
-(EdgePQ); the table shows the two-decimal values used in the paper.
+TG128/TG512. Its PPL is 18.2% lower than Q2_K and within 4.1% of F16. The
+unrounded values are 6.0944 (F16), 7.7528 (Q2_K), and 6.3443 (EdgePQ); the
+table reports two-decimal values.
 
 EdgePQ PPL is measured by reconstructing the trained PQ checkpoint into an
 FP16 Transformers model and evaluating complete, non-overlapping 4096-token
 WikiText-2 windows. Throughput loads the PQ side tensors embedded in
-`base-pq-4c8b.gguf`.
+`base-pq-4c8b.gguf`. The released 4c8b checkpoint stores all 224 trained linear
+states with input-axis partitioning (`axis=1`), so this artifact uses the S1
+AVX-512 LUT kernel with `d=4`; the generic runtime additionally supports S2.
 
 > [!IMPORTANT]
-> The table contains the paper reference values. Every reproduction writes its
-> own measurements to `output/throughput.csv` and `output/perplexity.csv`.
+> The table contains the released artifact's reference values. Every
+> reproduction writes its own measurements to `output/throughput.csv` and
+> `output/perplexity.csv`.
 > Absolute CPU throughput can vary with CPU load, NUMA placement, page-cache
 > state, and background contention; compare runs under the same conditions.
 
 ## Demo
 
-The ten-minute walkthrough covers environment and input preparation,
-correctness checks, the three-model smoke test, evaluation, and result
-inspection. [Watch or download the video](video_demo/demo.mp4).
+The online demonstration shows the EdgePQ artifact running from the public
+repository:
+
+https://github.com/user-attachments/assets/fdb0e12c-c5cb-42de-a32a-d360a3e8d43d
+
+A separate downloadable artifact walkthrough is retained in
+[`video_demo/demo.mp4`](video_demo/demo.mp4).
 
 ## Requirements
 
@@ -95,11 +95,11 @@ make demo
 ```
 
 `make demo` is the one-command artifact entry point. It creates or reuses the
-locked `.venv`, downloads only missing inputs, validates them, builds or reuses
+locked `.venv`, downloads only missing or stale inputs, validates them, builds or reuses
 the runtime, runs `pq-selftest`, and loads all three models in an eight-token
-smoke test. If both result CSVs are non-empty, it reuses them; otherwise it runs
-the complete benchmark and PPL evaluation. It then prints the result table and
-renders both charts.
+smoke test. It reuses result CSVs only when their cache key matches the pinned
+models and evaluation protocol; otherwise it runs the complete benchmark and
+PPL evaluation. It then prints the result table and renders both charts.
 
 The first run downloads approximately 60 GB and can take one to three hours.
 Later runs reuse the environment, inputs, build, and existing result CSVs.
@@ -107,14 +107,22 @@ Later runs reuse the environment, inputs, build, and existing result CSVs.
 ### Interactive Generation
 
 ```bash
-make chat GGML_CUDA=OFF
+make chat MODEL=pq
+make chat MODEL=16
+make chat MODEL=k2
 ```
 
-The runner inspects the GGUF metadata automatically. A model containing
+`MODEL=pq`, `MODEL=16`, and `MODEL=k2` select EdgePQ, FP16, and Q2_K,
+respectively; omitting `MODEL` defaults to EdgePQ. Each command prepares only
+the selected model and reuses it when already present. The FP16 and Q2_K modes
+disable PQ execution, while the EdgePQ mode enables its embedded PQ side
+tensors. EdgePQ defaults to deterministic greedy decoding (`temperature=0`);
+FP16 and Q2_K retain `temperature=0.7`. Override either behavior with
+`CHAT_TEMPERATURE`. The runner inspects the GGUF metadata automatically. A model containing
 `tokenizer.chat_template` uses llama.cpp's chat-template API and retains the
-standard system/user/assistant message history. A model without that metadata,
-including the current base EdgePQ model, uses completion mode: each entered
-prompt is an independent continuation and no synthetic chat format is added.
+standard system/user/assistant message history. A model without that metadata
+uses completion mode: each entered prompt is an independent continuation and
+no synthetic chat format is added.
 The selected mode and Prompt/Generation tokens per second are printed in the
 terminal. Use `/clear` to clear chat history and `/exit` to stop.
 
@@ -128,7 +136,12 @@ make chat GGML_CUDA=OFF CHAT_MODEL=/data/chat-edgepq.gguf CHAT_MODE=auto
 `CHAT_MODE` accepts `auto`, `chat`, or `completion`. Forced chat mode fails
 clearly if the GGUF has no embedded chat template. Other useful overrides are
 `CHAT_THREADS`, `CHAT_CPU_RANGE`, `CHAT_CONTEXT`, `CHAT_MAX_TOKENS`, and
-`CHAT_SYSTEM`.
+`CHAT_SYSTEM`. For example, this limits each response to 128 generated tokens
+and restores stochastic sampling at temperature 0.7:
+
+```bash
+make chat MODEL=pq CHAT_MAX_TOKENS=128 CHAT_TEMPERATURE=0.7
+```
 
 ## Step-by-Step Reproduction
 
@@ -206,8 +219,8 @@ charts. To force every measurement to rerun, use `make all` followed by
 | `make llama-build` | Build llama.cpp, PPL, quantizer, and PQ tools | `build/bin/` |
 | `make selftest` | Compare registered PQ execution with the reference path | Terminal PASS/failure |
 | `make smoke` | Load F16, Q2_K, and EdgePQ and generate eight tokens each | Terminal validation |
-| `make chat` | Auto-detect Chat or completion mode and start interactive generation | Terminal conversation and Token/s |
-| `make demo` | Run cache-aware end-to-end reproduction, including smoke and plots | CSVs, PNGs, terminal summary |
+| `make chat MODEL=pq\|16\|k2` | Select EdgePQ, FP16, or Q2_K and start interactive generation | Terminal conversation and Token/s |
+| `make demo` | Run revision-aware end-to-end reproduction, including smoke and plots | CSVs, PNGs, terminal summary |
 | `make benchmark` | Measure F16, Q2_K, and EdgePQ decode throughput | `output/throughput.csv` |
 | `make ppl` | Evaluate F16 and Q2_K perplexity | `output/perplexity.csv` |
 | `make pq-ppl` | Evaluate EdgePQ reconstruction perplexity | Appends to `output/perplexity.csv` |
@@ -215,7 +228,8 @@ charts. To force every measurement to rerun, use `make all` followed by
 | `make plot` | Print and render both result CSVs | Two PNG charts |
 
 The distinction between the two aggregate targets is intentional: `make demo`
-may reuse non-empty CSVs and always runs the smoke test and plotting stage;
+may reuse CSVs matching the current model/protocol cache key and always runs
+the smoke test and plotting stage;
 `make all` always reruns the measurements and leaves plotting as a separate
 `make plot` step.
 

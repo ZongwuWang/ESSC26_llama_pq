@@ -28,6 +28,7 @@ struct options {
     int threads = 60;
     int context = 4096;
     int max_tokens = 256;
+    float temperature = 0.7f;
     bool pq_decode = true;
 };
 
@@ -43,6 +44,7 @@ void usage(const char * program) {
         "  -t N                       CPU threads (default: 60)\n"
         "  -c N                       context size (default: 4096)\n"
         "  -n N                       maximum response tokens (default: 256)\n"
+        "  --temp N                    sampling temperature; 0 is greedy (default: 0.7)\n"
         "  --mode auto|chat|completion\n"
         "                             interaction mode (default: auto)\n"
         "  --system TEXT              system message or completion prefix\n"
@@ -76,6 +78,8 @@ options parse_options(int argc, char ** argv) {
             result.context = std::stoi(require_value(arg.c_str()));
         } else if (arg == "-n" || arg == "--max-tokens") {
             result.max_tokens = std::stoi(require_value(arg.c_str()));
+        } else if (arg == "--temp") {
+            result.temperature = std::stof(require_value("--temp"));
         } else if (arg == "--mode") {
             result.mode = parse_mode(require_value("--mode"));
         } else if (arg == "--system") {
@@ -95,6 +99,7 @@ options parse_options(int argc, char ** argv) {
     if (result.threads <= 0) throw std::runtime_error("threads must be positive");
     if (result.context <= 0) throw std::runtime_error("context must be positive");
     if (result.max_tokens <= 0) throw std::runtime_error("max tokens must be positive");
+    if (result.temperature < 0.0f) throw std::runtime_error("temperature must be non-negative");
     return result;
 }
 
@@ -188,9 +193,13 @@ int main(int argc, char ** argv) {
         const llama_vocab * vocab = llama_model_get_vocab(model);
         llama_sampler * sampler = llama_sampler_chain_init(
             llama_sampler_chain_default_params());
-        llama_sampler_chain_add(sampler, llama_sampler_init_min_p(0.05f, 1));
-        llama_sampler_chain_add(sampler, llama_sampler_init_temp(0.7f));
-        llama_sampler_chain_add(sampler, llama_sampler_init_dist(LLAMA_DEFAULT_SEED));
+        if (opt.temperature == 0.0f) {
+            llama_sampler_chain_add(sampler, llama_sampler_init_greedy());
+        } else {
+            llama_sampler_chain_add(sampler, llama_sampler_init_min_p(0.05f, 1));
+            llama_sampler_chain_add(sampler, llama_sampler_init_temp(opt.temperature));
+            llama_sampler_chain_add(sampler, llama_sampler_init_dist(LLAMA_DEFAULT_SEED));
+        }
 
         std::vector<message> history;
         auto clear = [&]() {
@@ -205,6 +214,8 @@ int main(int argc, char ** argv) {
 
         std::fprintf(stderr, "[MODEL] %s\n", opt.model.c_str());
         std::fprintf(stderr, "[PQ] %s\n", opt.pq_decode ? "enabled" : "disabled");
+        std::fprintf(stderr, "[TEMP] %.3g%s\n", opt.temperature,
+                     opt.temperature == 0.0f ? " (greedy)" : "");
         std::fprintf(stderr, "[MODE] %s%s\n",
                      chat_mode ? "chat: embedded tokenizer.chat_template" :
                                  "completion: no template applied",

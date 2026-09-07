@@ -8,7 +8,7 @@ UV ?= uv
 CUDACXX ?=
 
 VENV ?= .venv
-PYTHON := $(VENV)/bin/python
+PYTHON := $(VENV)/bin/python # 
 HF := $(VENV)/bin/hf
 
 LLAMA_SRC ?= llama.cpp
@@ -43,10 +43,10 @@ NPROC := $(shell nproc 2>/dev/null || echo 1)
 ifeq ($(UNAME_M),aarch64)
 GGML_CUDA ?= OFF
 AE_THREADS ?= $(NPROC)
-AE_NUMA ?= system
+AE_NUMA ?= distribute
 CHAT_CPU_RANGE ?= 0-$(shell expr $(NPROC) - 1 || echo 0)
 PPL_THREADS ?= $(NPROC)
-PPL_NUMA ?= system
+PPL_NUMA ?= distribute
 else
 GGML_CUDA ?= ON
 AE_THREADS ?= 60

@@ -98,7 +98,7 @@ std::atomic<bool> g_pq_enabled{false};
 
 constexpr int kMaxThreads = 1024; // Kunpeng nodes can expose 640+ logical CPUs
 
-std::vector<pq_f16> g_s1_partials;
+std::vector<float> g_s1_partials; // float32 partials: avoids fp16<->f32 in the LUT loop
 std::mutex          g_s1_mu;
 
 struct MulmatAcc { uint64_t busy_us = 0, count = 0; };
@@ -154,6 +154,17 @@ static inline int32x4_t pq_neon_sdot(int32x4_t acc, int8x16_t a, int8x16_t b) {
 }
 #endif
 
+static inline float32x4_t pq_load_f16x4(const pq_f16 * p) {
+#if defined(__ARM_FEATURE_FP16_VECTOR_ARITHMETIC)
+    return vcvt_f32_f16(vld1_f16((const __fp16 *) p));
+#else
+    float tmp[4] = {
+        pq_to_f32(p[0]), pq_to_f32(p[1]), pq_to_f32(p[2]), pq_to_f32(p[3]),
+    };
+    return vld1q_f32(tmp);
+#endif
+}
+
 static void pq_build_dt_scalar(int ds, const pq_f16 * xh, const pq_f16 * cbh,
                                int subspace, float * dt) {
     for (int k = 0; k < GGML_PQ_K; k++) {
@@ -166,86 +177,192 @@ static void pq_build_dt_scalar(int ds, const pq_f16 * xh, const pq_f16 * cbh,
     }
 }
 
+// EdgePQ-4c8b hot path: ds=4, codebook SoA layout [(i*4+d)*K + k].
+static void pq_build_dt_ds4(const pq_f16 * xh, const pq_f16 * cbh,
+                            int subspace, float * dt) {
+    const float32x4_t vx0 = vdupq_n_f32(pq_to_f32(xh[(size_t) subspace * 4 + 0]));
+    const float32x4_t vx1 = vdupq_n_f32(pq_to_f32(xh[(size_t) subspace * 4 + 1]));
+    const float32x4_t vx2 = vdupq_n_f32(pq_to_f32(xh[(size_t) subspace * 4 + 2]));
+    const float32x4_t vx3 = vdupq_n_f32(pq_to_f32(xh[(size_t) subspace * 4 + 3]));
+    const pq_f16 * c0 = cbh + (size_t) (subspace * 4 + 0) * GGML_PQ_K;
+    const pq_f16 * c1 = cbh + (size_t) (subspace * 4 + 1) * GGML_PQ_K;
+    const pq_f16 * c2 = cbh + (size_t) (subspace * 4 + 2) * GGML_PQ_K;
+    const pq_f16 * c3 = cbh + (size_t) (subspace * 4 + 3) * GGML_PQ_K;
+    for (int k = 0; k < GGML_PQ_K; k += 4) {
+        float32x4_t v = vmulq_f32(vx0, pq_load_f16x4(c0 + k));
+        v = vfmaq_f32(v, vx1, pq_load_f16x4(c1 + k));
+        v = vfmaq_f32(v, vx2, pq_load_f16x4(c2 + k));
+        v = vfmaq_f32(v, vx3, pq_load_f16x4(c3 + k));
+        vst1q_f32(dt + k, v);
+    }
+}
+
+static void pq_quantize_dt(const float * dt, int8_t * dt8, float * inv_out) {
+    float32x4_t vmax = vdupq_n_f32(0.f);
+    for (int k = 0; k < GGML_PQ_K; k += 4) {
+        vmax = vmaxq_f32(vmax, vabsq_f32(vld1q_f32(dt + k)));
+    }
+    const float amax = vmaxvq_f32(vmax);
+    if (!(amax > 0.f)) {
+        memset(dt8, 0, GGML_PQ_K);
+        *inv_out = 0.f;
+        return;
+    }
+    *inv_out = amax / 127.0f;
+    const float sc = 127.0f / amax;
+    const float32x4_t vsc = vdupq_n_f32(sc);
+    for (int k = 0; k < GGML_PQ_K; k += 16) {
+        float32x4_t f0 = vmulq_f32(vld1q_f32(dt + k + 0), vsc);
+        float32x4_t f1 = vmulq_f32(vld1q_f32(dt + k + 4), vsc);
+        float32x4_t f2 = vmulq_f32(vld1q_f32(dt + k + 8), vsc);
+        float32x4_t f3 = vmulq_f32(vld1q_f32(dt + k + 12), vsc);
+        // round-to-nearest via +0.5 with sign handling is awkward; use scalar
+        // for 16 lanes — still far cheaper than the old per-output fp16 path.
+        float tmp[16];
+        vst1q_f32(tmp + 0, f0);
+        vst1q_f32(tmp + 4, f1);
+        vst1q_f32(tmp + 8, f2);
+        vst1q_f32(tmp + 12, f3);
+        for (int t = 0; t < 16; t++) {
+            dt8[k + t] = (int8_t) std::lround(tmp[t]);
+        }
+    }
+}
+
+static inline void pq_acc_lut16(float * yl, const uint8_t * ii, const int8_t * dt8,
+                                float inv) {
+    const uint8x16_t iv = vld1q_u8(ii);
+    const int8x16_t qv = pq_neon_tbl256_s8(dt8, iv);
+    const int16x8_t qlo = vmovl_s8(vget_low_s8(qv));
+    const int16x8_t qhi = vmovl_high_s8(qv);
+    float32x4_t f0 = vcvtq_f32_s32(vmovl_s16(vget_low_s16(qlo)));
+    float32x4_t f1 = vcvtq_f32_s32(vmovl_high_s16(qlo));
+    float32x4_t f2 = vcvtq_f32_s32(vmovl_s16(vget_low_s16(qhi)));
+    float32x4_t f3 = vcvtq_f32_s32(vmovl_high_s16(qhi));
+    float32x4_t y0 = vld1q_f32(yl + 0);
+    float32x4_t y1 = vld1q_f32(yl + 4);
+    float32x4_t y2 = vld1q_f32(yl + 8);
+    float32x4_t y3 = vld1q_f32(yl + 12);
+    y0 = vfmaq_n_f32(y0, f0, inv);
+    y1 = vfmaq_n_f32(y1, f1, inv);
+    y2 = vfmaq_n_f32(y2, f2, inv);
+    y3 = vfmaq_n_f32(y3, f3, inv);
+    vst1q_f32(yl + 0, y0);
+    vst1q_f32(yl + 4, y1);
+    vst1q_f32(yl + 8, y2);
+    vst1q_f32(yl + 12, y3);
+}
+
 static void pq_s1_accumulate_subspace(const PQTensor & t, const pq_f16 * xh,
-                                      int subspace, pq_f16 * yl) {
+                                      int subspace, float * yl) {
     const int ds = t.ds;
     const int dout = (int) t.n_out;
     const pq_f16 * cbh = t.cbh.data();
     const uint8_t * idx = t.idx.data();
 
     float dt[GGML_PQ_K];
-    pq_build_dt_scalar(ds, xh, cbh, subspace, dt);
-
-    float amax = 0.f;
-    for (int k = 0; k < GGML_PQ_K; k++) {
-        amax = fmaxf(amax, fabsf(dt[k]));
-    }
-    const float inv = amax > 0.f ? amax / 127.0f : 0.f;
-    int8_t dt8[GGML_PQ_K];
-    if (amax > 0.f) {
-        const float sc = 127.0f / amax;
-        for (int k = 0; k < GGML_PQ_K; k++) {
-            dt8[k] = (int8_t) std::lround(dt[k] * sc);
-        }
+    if (ds == 4) {
+        pq_build_dt_ds4(xh, cbh, subspace, dt);
     } else {
-        memset(dt8, 0, sizeof(dt8));
+        pq_build_dt_scalar(ds, xh, cbh, subspace, dt);
     }
+
+    int8_t dt8[GGML_PQ_K];
+    float inv = 0.f;
+    pq_quantize_dt(dt, dt8, &inv);
 
     const uint8_t * ii = idx + (size_t) subspace * dout;
     int j = 0;
     for (; j + 15 < dout; j += 16) {
-        const uint8x16_t iv = vld1q_u8(ii + j);
-        const int8x16_t qv = pq_neon_tbl256_s8(dt8, iv);
-        const int16x8_t qlo = vmovl_s8(vget_low_s8(qv));
-        const int16x8_t qhi = vmovl_high_s8(qv);
-        float32x4_t f0 = vcvtq_f32_s32(vmovl_s16(vget_low_s16(qlo)));
-        float32x4_t f1 = vcvtq_f32_s32(vmovl_high_s16(qlo));
-        float32x4_t f2 = vcvtq_f32_s32(vmovl_s16(vget_low_s16(qhi)));
-        float32x4_t f3 = vcvtq_f32_s32(vmovl_high_s16(qhi));
-        f0 = vmulq_n_f32(f0, inv);
-        f1 = vmulq_n_f32(f1, inv);
-        f2 = vmulq_n_f32(f2, inv);
-        f3 = vmulq_n_f32(f3, inv);
-        float ytmp[16];
-        for (int t = 0; t < 16; t++) {
-            ytmp[t] = pq_to_f32(yl[j + t]);
-        }
-        float32x4_t y0 = vld1q_f32(ytmp + 0);
-        float32x4_t y1 = vld1q_f32(ytmp + 4);
-        float32x4_t y2 = vld1q_f32(ytmp + 8);
-        float32x4_t y3 = vld1q_f32(ytmp + 12);
-        y0 = vaddq_f32(y0, f0);
-        y1 = vaddq_f32(y1, f1);
-        y2 = vaddq_f32(y2, f2);
-        y3 = vaddq_f32(y3, f3);
-        vst1q_f32(ytmp + 0, y0);
-        vst1q_f32(ytmp + 4, y1);
-        vst1q_f32(ytmp + 8, y2);
-        vst1q_f32(ytmp + 12, y3);
-        for (int t = 0; t < 16; t++) {
-            yl[j + t] = pq_from_f32(ytmp[t]);
-        }
+        pq_acc_lut16(yl + j, ii + j, dt8, inv);
     }
     for (; j < dout; j++) {
-        const float acc = pq_to_f32(yl[j]) + (float) dt8[ii[j]] * inv;
-        yl[j] = pq_from_f32(acc);
+        yl[j] += (float) dt8[ii[j]] * inv;
+    }
+}
+
+// Process 4 subspaces per yl sweep (matches x86 pq_s1_phase1_ds4_block intent).
+static void pq_s1_phase1_ds4(const PQTensor & t, const pq_f16 * xh,
+                             int i0, int i1, float * yl) {
+    const int dout = (int) t.n_out;
+    const pq_f16 * cbh = t.cbh.data();
+    const uint8_t * idx = t.idx.data();
+    int i = i0;
+    for (; i + 3 < i1; i += 4) {
+        float dt[4][GGML_PQ_K];
+        int8_t dt8[4][GGML_PQ_K];
+        float inv[4];
+        for (int s = 0; s < 4; s++) {
+            pq_build_dt_ds4(xh, cbh, i + s, dt[s]);
+            pq_quantize_dt(dt[s], dt8[s], &inv[s]);
+        }
+        int j = 0;
+        for (; j + 15 < dout; j += 16) {
+            float32x4_t y0 = vld1q_f32(yl + j + 0);
+            float32x4_t y1 = vld1q_f32(yl + j + 4);
+            float32x4_t y2 = vld1q_f32(yl + j + 8);
+            float32x4_t y3 = vld1q_f32(yl + j + 12);
+            for (int s = 0; s < 4; s++) {
+                const uint8x16_t iv = vld1q_u8(idx + (size_t) (i + s) * dout + j);
+                const int8x16_t qv = pq_neon_tbl256_s8(dt8[s], iv);
+                const int16x8_t qlo = vmovl_s8(vget_low_s8(qv));
+                const int16x8_t qhi = vmovl_high_s8(qv);
+                float32x4_t f0 = vcvtq_f32_s32(vmovl_s16(vget_low_s16(qlo)));
+                float32x4_t f1 = vcvtq_f32_s32(vmovl_high_s16(qlo));
+                float32x4_t f2 = vcvtq_f32_s32(vmovl_s16(vget_low_s16(qhi)));
+                float32x4_t f3 = vcvtq_f32_s32(vmovl_high_s16(qhi));
+                y0 = vfmaq_n_f32(y0, f0, inv[s]);
+                y1 = vfmaq_n_f32(y1, f1, inv[s]);
+                y2 = vfmaq_n_f32(y2, f2, inv[s]);
+                y3 = vfmaq_n_f32(y3, f3, inv[s]);
+            }
+            vst1q_f32(yl + j + 0, y0);
+            vst1q_f32(yl + j + 4, y1);
+            vst1q_f32(yl + j + 8, y2);
+            vst1q_f32(yl + j + 12, y3);
+        }
+        for (; j < dout; j++) {
+            float v = yl[j];
+            for (int s = 0; s < 4; s++) {
+                v += (float) dt8[s][idx[(size_t) (i + s) * dout + j]] * inv[s];
+            }
+            yl[j] = v;
+        }
+    }
+    for (; i < i1; i++) {
+        pq_s1_accumulate_subspace(t, xh, i, yl);
     }
 }
 
 static void pq_s1_phase1(const PQTensor & t, const pq_f16 * xh,
-                         int i0, int i1, pq_f16 * yl) {
+                         int i0, int i1, float * yl) {
+    if (t.ds == 4) {
+        pq_s1_phase1_ds4(t, xh, i0, i1, yl);
+        return;
+    }
     for (int i = i0; i < i1; i++) {
         pq_s1_accumulate_subspace(t, xh, i, yl);
     }
 }
 
 static void pq_s1_phase2(const PQTensor & t, float * dst, int j0, int j1,
-                         int nth, const pq_f16 * base) {
+                         int nth, const float * base) {
     const size_t row = (size_t) t.n_out;
-    for (int j = j0; j < j1; j++) {
+    int j = j0;
+    for (; j + 3 < j1; j += 4) {
+        float32x4_t sum = vdupq_n_f32(0.f);
+        for (int p = 0; p < nth; p++) {
+            sum = vaddq_f32(sum, vld1q_f32(base + (size_t) p * row + j));
+        }
+        if (t.scaled) {
+            sum = vmulq_f32(sum, vld1q_f32(t.row_scale.data() + j));
+        }
+        vst1q_f32(dst + j, sum);
+    }
+    for (; j < j1; j++) {
         float sum = 0.f;
         for (int p = 0; p < nth; p++) {
-            sum += pq_to_f32(base[(size_t) p * row + j]);
+            sum += base[(size_t) p * row + j];
         }
         dst[j] = t.scaled ? sum * t.row_scale[(size_t) j] : sum;
     }

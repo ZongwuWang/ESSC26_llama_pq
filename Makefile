@@ -35,19 +35,35 @@ PPL_DATASET ?= $(DATASET_DIR)/wikitext-2-raw-v1
 TOKENIZER ?= $(MODEL_DIR)/tokenizer
 
 CUDA_DEVICE ?= 0
-GGML_CUDA ?= ON
 
+# Architecture defaults: Kunpeng/aarch64 is CPU-native (no CUDA); x86 keeps
+# the paper artifact defaults (CUDA ON, 60 threads, cores 0-59).
+UNAME_M := $(shell uname -m)
+NPROC := $(shell nproc 2>/dev/null || echo 1)
+ifeq ($(UNAME_M),aarch64)
+GGML_CUDA ?= OFF
+AE_THREADS ?= $(NPROC)
+AE_NUMA ?= system
+CHAT_CPU_RANGE ?= 0-$(shell expr $(NPROC) - 1 || echo 0)
+PPL_THREADS ?= $(NPROC)
+PPL_NUMA ?= system
+else
+GGML_CUDA ?= ON
 AE_THREADS ?= 60
+AE_NUMA ?= distribute
+CHAT_CPU_RANGE ?= 0-59
+PPL_THREADS ?= 60
+PPL_NUMA ?= distribute
+endif
+
 AE_REPETITIONS ?= 3
 AE_WARMUP ?= 1
 AE_GENERATIONS ?= 128,512
 AE_CONTEXT ?= 2048
-AE_NUMA ?= distribute
 
 CHAT_MODEL ?= $(PQ_MODEL)
 CHAT_MODE ?= auto
 CHAT_THREADS ?= $(AE_THREADS)
-CHAT_CPU_RANGE ?= 0-59
 CHAT_CONTEXT ?= 4096
 CHAT_MAX_TOKENS ?= 256
 CHAT_SYSTEM ?=
@@ -56,8 +72,6 @@ GGUF_PPL_CONTEXT ?= 3072
 GGUF_PPL_STRIDE ?= 2048
 PQ_PPL_CONTEXT ?= 4096
 PQ_PPL_STRIDE ?= 4096
-PPL_THREADS ?= 60
-PPL_NUMA ?= distribute
 
 THROUGHPUT_OUTPUT := $(OUTPUT_DIR)/throughput.csv
 PPL_OUTPUT := $(OUTPUT_DIR)/perplexity.csv
@@ -79,7 +93,8 @@ LLAMA_LDLIBS := -lllama -lggml -lggml-cpu -lggml-base -lpthread -ldl -lm
 .PHONY: help all demo env prepare-edgepq prepare-baselines prepare-dataset prepare-inputs \
 	check-benchmark-inputs check-ppl-inputs check-pq-ppl-inputs check-inputs \
 	llama-build llama_pq prepare-chat-model chat selftest smoke benchmark ppl pq-ppl \
-	plot clean distclean
+	plot clean distclean kunpeng-check kunpeng-build kunpeng-selftest \
+	kunpeng-smoke kunpeng-benchmark kunpeng-chat
 
 help:
 	@echo "EdgePQ artifact targets:"
@@ -97,6 +112,14 @@ help:
 	@echo "  make pq-ppl         Evaluate PQ reconstruction perplexity"
 	@echo "  make all            Rerun the complete paper evaluation"
 	@echo "  make plot           Render throughput and PPL charts"
+	@echo ""
+	@echo "Kunpeng / aarch64 targets (see docs/DEPLOY_KUNPENG.md):"
+	@echo "  make kunpeng-check      Verify host is aarch64 and print CPU info"
+	@echo "  make kunpeng-build      CPU-only build (GGML_CUDA=OFF)"
+	@echo "  make kunpeng-selftest   Build + PQ numeric self-test"
+	@echo "  make kunpeng-smoke      8-token F16/Q2_K/EdgePQ smoke test"
+	@echo "  make kunpeng-benchmark  Decode throughput -> output/throughput.csv"
+	@echo "  make kunpeng-chat       Interactive EdgePQ chat on all CPU cores"
 
 
 all:
@@ -345,6 +368,36 @@ plot: env
 	$(PYTHON) plot_results.py --throughput "$(THROUGHPUT_OUTPUT)" \
 		--perplexity "$(PPL_OUTPUT)" --output-dir "$(OUTPUT_DIR)"
 	@echo "[OK] Charts rendered in $(OUTPUT_DIR)/"
+
+kunpeng-check:
+	@test "$(UNAME_M)" = "aarch64" || { \
+		echo "[ERROR] kunpeng-* targets require aarch64 (got $(UNAME_M))" >&2; \
+		exit 1; \
+	}
+	@echo "[OK] arch=$(UNAME_M) nproc=$(NPROC) GGML_CUDA=$(GGML_CUDA) AE_THREADS=$(AE_THREADS)"
+	@echo "[OK] CHAT_CPU_RANGE=$(CHAT_CPU_RANGE) AE_NUMA=$(AE_NUMA)"
+	@command -v $(CMAKE) >/dev/null || { echo "[ERROR] cmake not found" >&2; exit 1; }
+	@command -v $(NINJA) >/dev/null || { echo "[ERROR] ninja not found" >&2; exit 1; }
+	@command -v $(CXX) >/dev/null || { echo "[ERROR] C++ compiler not found: $(CXX)" >&2; exit 1; }
+	@(grep -E 'Features|Flags' /proc/cpuinfo 2>/dev/null | head -3) || true
+	@echo "[OK] Host toolchain ready for Kunpeng NEON PQ path (pq-gemv-arm.cpp)"
+
+kunpeng-build: kunpeng-check
+	$(MAKE) llama-build GGML_CUDA=OFF
+
+kunpeng-selftest: kunpeng-build
+	$(MAKE) selftest GGML_CUDA=OFF
+
+kunpeng-smoke: kunpeng-check
+	$(MAKE) smoke GGML_CUDA=OFF AE_THREADS="$(AE_THREADS)" AE_NUMA="$(AE_NUMA)"
+
+kunpeng-benchmark: kunpeng-check
+	$(MAKE) benchmark GGML_CUDA=OFF AE_THREADS="$(AE_THREADS)" AE_NUMA="$(AE_NUMA)" \
+		AE_REPETITIONS="$(AE_REPETITIONS)" AE_GENERATIONS="$(AE_GENERATIONS)"
+
+kunpeng-chat: kunpeng-check
+	$(MAKE) chat GGML_CUDA=OFF CHAT_THREADS="$(CHAT_THREADS)" \
+		CHAT_CPU_RANGE="$(CHAT_CPU_RANGE)"
 
 clean:
 	rm -f llama_pq

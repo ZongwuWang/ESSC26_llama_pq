@@ -3,17 +3,21 @@
 // Linear weights are PQ-compressed offline/at-load into per-subspace
 // codebooks + 1 byte/weight indices (d_sub=2..8, K=256). During decode
 // (n_tokens==1) ggml_compute_forward_mul_mat intercepts registered tensors
-// and runs the PQ GEMV kernels ported from pq_cpu/bench_pq.cpp. Prefill and
-// unregistered tensors keep the original path (original weights stay valid).
+// and runs the PQ GEMV kernels. Prefill and unregistered tensors keep the
+// original path (original weights stay valid).
+//
+// CPU backends (selected at compile time):
+//   x86-64 : pq-gemv.cpp        — AVX-512 FP16 + VBMI (+ VNNI for S2)
+//   aarch64: pq-gemv-arm.cpp    — NEON 256-entry byte LUT (+ SDOT when available)
 //
 // Modes:
 //   S1 (0): partition along the INPUT dim. y[j] = sum_i dt_i[idx_i[j]],
 //           dt_i[k] = sum_d x[i*ds+d] * c[i][k][d]. Codebook stored fp16
 //           (SoA, [(i*ds+d)*K+k]); dt tables are rebuilt per GEMV and
-//           int8-quantized on the fly (vpermi2b byte-LUT).
+//           int8-quantized on the fly (byte-LUT).
 //   S2 (1): partition along the OUTPUT dim. y[i*ds+s] = sum_j x[j]*c_s(idx_ij).
 //           Codebook stored int8 with per-(i,side) dequant scale; x scaled
-//           by 1/128 to keep the fp16 accumulator in range.
+//           by 1/128 to keep the accumulator in range.
 #ifndef GGML_PQ_GEMV_H
 #define GGML_PQ_GEMV_H
 

@@ -1,5 +1,8 @@
-// PQ decode-time GEMV for ARM64 (Kunpeng / NEON). Scalar + NEON helpers;
-// same registry/orchestration as pq-gemv.cpp (AVX-512 x86 path).
+// PQ decode-time GEMV for ARM64 (Huawei Kunpeng / aarch64).
+//
+// Mirrors the public ggml_pq_* API in pq-gemv.cpp (AVX-512 x86 path).
+// Hot path uses NEON 256-entry byte LUT (+ optional SDOT). SVE is reserved
+// for a later width-specialized kernel; ggml's own SVE paths remain unchanged.
 #include "ggml-pq.h"
 
 #if defined(__aarch64__)
@@ -56,8 +59,8 @@ struct huge_vec {
         memcpy(ptr, src, n * sizeof(T));
     }
     huge_vec() = default;
-    huge_vec(huge_vec && o) : ptr(o.ptr), n(o.n) { o.ptr = nullptr; o.n = 0; }
-    huge_vec & operator=(huge_vec && o) {
+    huge_vec(huge_vec && o) noexcept : ptr(o.ptr), n(o.n) { o.ptr = nullptr; o.n = 0; }
+    huge_vec & operator=(huge_vec && o) noexcept {
         if (this != &o) {
             free_mem();
             ptr = o.ptr;
@@ -102,25 +105,43 @@ struct MulmatAcc { uint64_t busy_us = 0, count = 0; };
 static std::map<std::string, MulmatAcc> g_mulmat_acc;
 static std::mutex g_mulmat_mu;
 
-#if defined(__ARM_FEATURE_FP16_VECTOR_ARITHMETIC)
-static void pq_build_dt_neon(int ds, const pq_f16 * xh, const pq_f16 * cbh,
-                             int subspace, float * dt) {
-    for (int k = 0; k < GGML_PQ_K; k++) {
-        float16x8_t acc = vdupq_n_f16(0.f);
-        int d = 0;
-        for (; d + 7 < ds; d += 8) {
-            float16x8_t xv = vld1q_f16((const __fp16 *) xh + subspace * ds + d);
-            float16x8_t cv = vld1q_f16((const __fp16 *) cbh + ((size_t)(subspace * ds + d) * GGML_PQ_K) + k);
-            acc = vfmaq_f16(acc, xv, cv);
-        }
-        float s = 0.f;
-        for (int q = 0; q < 8; q++) s += (float) acc[q];
-        for (; d < ds; d++) {
-            s += pq_to_f32(xh[(size_t) subspace * ds + d]) *
-                 pq_to_f32(cbh[((size_t)(subspace * ds + d) * GGML_PQ_K) + k]);
-        }
-        dt[k] = s;
-    }
+// ---------------------------------------------------------------------------
+// NEON helpers: true 256-entry byte LUT (vqtbl1 alone only covers 16 entries).
+// Four vqtbl4q tables cover bytes [0,64), [64,128), [128,192), [192,256).
+// Out-of-range lanes are zeroed by the table instruction, so OR merges safely.
+// ---------------------------------------------------------------------------
+static inline uint8x16_t pq_neon_tbl256(const uint8_t * table, uint8x16_t idx) {
+    const uint8x16x4_t t0 = vld1q_u8_x4(table + 0);
+    const uint8x16x4_t t1 = vld1q_u8_x4(table + 64);
+    const uint8x16x4_t t2 = vld1q_u8_x4(table + 128);
+    const uint8x16x4_t t3 = vld1q_u8_x4(table + 192);
+    const uint8x16_t r0 = vqtbl4q_u8(t0, idx);
+    const uint8x16_t r1 = vqtbl4q_u8(t1, vsubq_u8(idx, vdupq_n_u8(64)));
+    const uint8x16_t r2 = vqtbl4q_u8(t2, vsubq_u8(idx, vdupq_n_u8(128)));
+    const uint8x16_t r3 = vqtbl4q_u8(t3, vsubq_u8(idx, vdupq_n_u8(192)));
+    return vorrq_u8(vorrq_u8(r0, r1), vorrq_u8(r2, r3));
+}
+
+static inline int8x16_t pq_neon_tbl256_s8(const int8_t * table, uint8x16_t idx) {
+    return vreinterpretq_s8_u8(pq_neon_tbl256((const uint8_t *) table, idx));
+}
+
+#if defined(__ARM_FEATURE_DOTPROD)
+static inline int32x4_t pq_neon_sdot(int32x4_t acc, int8x16_t a, int8x16_t b) {
+    return vdotq_s32(acc, a, b);
+}
+#else
+// Portable fallback: signed int8 x signed int8 -> int32 accumulate (16 lanes).
+static inline int32x4_t pq_neon_sdot(int32x4_t acc, int8x16_t a, int8x16_t b) {
+    const int16x8_t al = vmovl_s8(vget_low_s8(a));
+    const int16x8_t ah = vmovl_high_s8(a);
+    const int16x8_t bl = vmovl_s8(vget_low_s8(b));
+    const int16x8_t bh = vmovl_high_s8(b);
+    acc = vaddq_s32(acc, vmull_s16(vget_low_s16(al), vget_low_s16(bl)));
+    acc = vaddq_s32(acc, vmull_high_s16(al, bl));
+    acc = vaddq_s32(acc, vmull_s16(vget_low_s16(ah), vget_low_s16(bh)));
+    acc = vaddq_s32(acc, vmull_high_s16(ah, bh));
+    return acc;
 }
 #endif
 
@@ -144,11 +165,7 @@ static void pq_s1_accumulate_subspace(const PQTensor & t, const pq_f16 * xh,
     const uint8_t * idx = t.idx.data();
 
     float dt[GGML_PQ_K];
-#if defined(__ARM_FEATURE_FP16_VECTOR_ARITHMETIC)
-    pq_build_dt_neon(ds, xh, cbh, subspace, dt);
-#else
     pq_build_dt_scalar(ds, xh, cbh, subspace, dt);
-#endif
 
     float amax = 0.f;
     for (int k = 0; k < GGML_PQ_K; k++) {
@@ -166,7 +183,41 @@ static void pq_s1_accumulate_subspace(const PQTensor & t, const pq_f16 * xh,
     }
 
     const uint8_t * ii = idx + (size_t) subspace * dout;
-    for (int j = 0; j < dout; j++) {
+    int j = 0;
+    for (; j + 15 < dout; j += 16) {
+        const uint8x16_t iv = vld1q_u8(ii + j);
+        const int8x16_t qv = pq_neon_tbl256_s8(dt8, iv);
+        const int16x8_t qlo = vmovl_s8(vget_low_s8(qv));
+        const int16x8_t qhi = vmovl_high_s8(qv);
+        float32x4_t f0 = vcvtq_f32_s32(vmovl_s16(vget_low_s16(qlo)));
+        float32x4_t f1 = vcvtq_f32_s32(vmovl_high_s16(qlo));
+        float32x4_t f2 = vcvtq_f32_s32(vmovl_s16(vget_low_s16(qhi)));
+        float32x4_t f3 = vcvtq_f32_s32(vmovl_high_s16(qhi));
+        f0 = vmulq_n_f32(f0, inv);
+        f1 = vmulq_n_f32(f1, inv);
+        f2 = vmulq_n_f32(f2, inv);
+        f3 = vmulq_n_f32(f3, inv);
+        float ytmp[16];
+        for (int t = 0; t < 16; t++) {
+            ytmp[t] = pq_to_f32(yl[j + t]);
+        }
+        float32x4_t y0 = vld1q_f32(ytmp + 0);
+        float32x4_t y1 = vld1q_f32(ytmp + 4);
+        float32x4_t y2 = vld1q_f32(ytmp + 8);
+        float32x4_t y3 = vld1q_f32(ytmp + 12);
+        y0 = vaddq_f32(y0, f0);
+        y1 = vaddq_f32(y1, f1);
+        y2 = vaddq_f32(y2, f2);
+        y3 = vaddq_f32(y3, f3);
+        vst1q_f32(ytmp + 0, y0);
+        vst1q_f32(ytmp + 4, y1);
+        vst1q_f32(ytmp + 8, y2);
+        vst1q_f32(ytmp + 12, y3);
+        for (int t = 0; t < 16; t++) {
+            yl[j + t] = pq_from_f32(ytmp[t]);
+        }
+    }
+    for (; j < dout; j++) {
         const float acc = pq_to_f32(yl[j]) + (float) dt8[ii[j]] * inv;
         yl[j] = pq_from_f32(acc);
     }
@@ -224,9 +275,10 @@ static S2XBufs pq_s2_prescale_x(const PQTensor & t, const void * x, int x_type) 
     return { xh.data(), xq.data(), xs, sx };
 }
 
-#if defined(__ARM_FEATURE_DOTPROD)
-static void pq_s2_gemv_ds2_dotprod(const PQTensor & t, const S2XBufs & xb,
-                                   float * dst, int i0, int i1) {
+// S2 ds==2: signed codebook LUT + signed xq (equivalent to x86 unsigned LUT
+// with +128 bias and dpbusd correction, but simpler on NEON/SDOT).
+static void pq_s2_gemv_ds2_neon(const PQTensor & t, const S2XBufs & xb,
+                                float * dst, int i0, int i1) {
     const int din = (int) t.n_in;
     const int8_t * cb8 = t.cb8.data();
     const float * inv = t.inv.data();
@@ -234,31 +286,28 @@ static void pq_s2_gemv_ds2_dotprod(const PQTensor & t, const S2XBufs & xb,
     const pq_f16 * xh = xb.xh;
     const int8_t * xq = xb.xq;
     const float xs = xb.xs;
-    const int64_t sx = xb.sx;
-    const float corr = 128.0f * (float) sx;
+    (void) xb.sx; // x86 unsigned-LUT path needs sx for +128 correction; signed NEON does not
 
     for (int i = i0; i < i1; i++) {
         const int8_t * ce = cb8 + (size_t) i * 512;
         const int8_t * co = ce + 256;
-        const int8_t * ceu = t.cb8u.data() + (size_t) i * 512;
-        const int8_t * cou = ceu + 256;
         const uint8_t * ii = idx + (size_t) i * din;
 
         int32x4_t ae = vdupq_n_s32(0);
         int32x4_t ao = vdupq_n_s32(0);
         int j = 0;
         for (; j + 15 < din; j += 16) {
-            int8x16_t xv = vld1q_s8(xq + j);
-            uint8x16_t iv = vld1q_u8(ii + j);
-            int8x16_t qe = vqtbl1q_s8(vld1q_s8(ceu), iv);
-            int8x16_t qo = vqtbl1q_s8(vld1q_s8(cou), iv);
-            ae = vdotq_s32(ae, qe, xv);
-            ao = vdotq_s32(ao, qo, xv);
+            const int8x16_t xv = vld1q_s8(xq + j);
+            const uint8x16_t iv = vld1q_u8(ii + j);
+            const int8x16_t qe = pq_neon_tbl256_s8(ce, iv);
+            const int8x16_t qo = pq_neon_tbl256_s8(co, iv);
+            ae = pq_neon_sdot(ae, qe, xv);
+            ao = pq_neon_sdot(ao, qo, xv);
         }
-        int32_t se = vaddlvq_s32(ae);
-        int32_t so = vaddlvq_s32(ao);
-        float s0 = ((float) se - corr) / xs;
-        float s1 = ((float) so - corr) / xs;
+        int32_t se = (int32_t) vaddvq_s32(ae);
+        int32_t so = (int32_t) vaddvq_s32(ao);
+        float s0 = (float) se / xs;
+        float s1 = (float) so / xs;
         for (; j < din; j++) {
             s0 += pq_to_f32(xh[j]) * ce[ii[j]];
             s1 += pq_to_f32(xh[j]) * co[ii[j]];
@@ -267,7 +316,6 @@ static void pq_s2_gemv_ds2_dotprod(const PQTensor & t, const S2XBufs & xb,
         dst[(size_t) i * 2 + 1] = s1 * inv[(size_t) i * 2 + 1];
     }
 }
-#endif
 
 static void pq_s2_gemv_scalar(const PQTensor & t, const S2XBufs & xb,
                               float * dst, int i0, int i1) {
@@ -296,12 +344,10 @@ static void pq_s2_gemv(const PQTensor & t, const S2XBufs & xb, float * dst,
     const int M = (int) (t.n_out / t.ds);
     const int i0 = (int) ((int64_t) M * ith / nth);
     const int i1 = (int) ((int64_t) M * (ith + 1) / nth);
-#if defined(__ARM_FEATURE_DOTPROD)
     if (t.ds == 2) {
-        pq_s2_gemv_ds2_dotprod(t, xb, dst, i0, i1);
+        pq_s2_gemv_ds2_neon(t, xb, dst, i0, i1);
         return;
     }
-#endif
     pq_s2_gemv_scalar(t, xb, dst, i0, i1);
 }
 

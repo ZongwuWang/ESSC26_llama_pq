@@ -96,7 +96,7 @@ struct PQTensor {
 std::unordered_map<std::string, PQTensor> g_pq;
 std::atomic<bool> g_pq_enabled{false};
 
-constexpr int kMaxThreads = 256;
+constexpr int kMaxThreads = 1024; // Kunpeng nodes can expose 640+ logical CPUs
 
 std::vector<pq_f16> g_s1_partials;
 std::mutex          g_s1_mu;
@@ -104,6 +104,15 @@ std::mutex          g_s1_mu;
 struct MulmatAcc { uint64_t busy_us = 0, count = 0; };
 static std::map<std::string, MulmatAcc> g_mulmat_acc;
 static std::mutex g_mulmat_mu;
+
+static inline void pq_barrier(void * threadpool, int nth) {
+    // OpenMP/ggml barriers require a live pool and >1 participants. Never
+    // dereference a null threadpool (direct mul_mat_vec unit tests).
+    if (nth <= 1 || threadpool == nullptr) {
+        return;
+    }
+    ggml_barrier((struct ggml_threadpool *) threadpool);
+}
 
 // ---------------------------------------------------------------------------
 // NEON helpers: true 256-entry byte LUT (vqtbl1 alone only covers 16 entries).
@@ -360,7 +369,9 @@ struct S1Group {
     const pq_f16 * xh[4];
 };
 
-S1Group g_s1_group[kMaxThreads];
+// Per-OS-thread group state: avoids a fixed ith cap (Kunpeng can be 640+ CPUs)
+// and matches OpenMP's one-worker-per-thread scheduling.
+static thread_local S1Group g_s1_tls;
 
 static void pq_copy_input_row(const PQTensor & t, const void * x, int x_type,
                               pq_f16 * out) {
@@ -428,7 +439,7 @@ static void pq_s1_flush(S1Group & g, int ith, int nth, void * threadpool, bool s
         }
     }
 
-    ggml_barrier((struct ggml_threadpool *) threadpool);
+    pq_barrier(threadpool, nth);
 
     const int j0 = (int) ((int64_t) Dtot * ith / nth);
     const int j1 = (int) ((int64_t) Dtot * (ith + 1) / nth);
@@ -444,7 +455,7 @@ static void pq_s1_flush(S1Group & g, int ith, int nth, void * threadpool, bool s
         d0 += (int) tm.n_out;
     }
     if (sync) {
-        ggml_barrier((struct ggml_threadpool *) threadpool);
+        pq_barrier(threadpool, nth);
     }
     g.n = 0;
     g.active = false;
@@ -658,10 +669,7 @@ int ggml_pq_mul_mat_fused(const char * name, const void * key, const void * x,
     }
 
     if (t.mode == 2) {
-        if (ith >= kMaxThreads) {
-            return GGML_PQ_MM_NONE;
-        }
-        S1Group & g = g_s1_group[ith];
+        S1Group & g = g_s1_tls;
         pq_s1_flush(g, ith, nth, threadpool, true);
         for (int m = 0; m < t.n_seg; m++) {
             pq_s1_group_add(g, *t.seg_t[m], key, x, x_type, dst + t.seg_off[m]);
@@ -670,18 +678,7 @@ int ggml_pq_mul_mat_fused(const char * name, const void * key, const void * x,
         return GGML_PQ_MM_DONE;
     }
 
-    if (ith >= kMaxThreads) {
-        if (t.mode == 1) {
-            pq_s2_gemv(t, pq_s2_prescale_x(t, x, x_type), dst, ith, nth);
-        } else {
-            S1Group g;
-            pq_s1_group_add(g, t, key, x, x_type, dst);
-            pq_s1_flush(g, ith, nth, threadpool, false);
-        }
-        return GGML_PQ_MM_DONE;
-    }
-
-    S1Group & g = g_s1_group[ith];
+    S1Group & g = g_s1_tls;
     if (t.mode == 1) {
         pq_s1_flush(g, ith, nth, threadpool, true);
         pq_s2_gemv(t, pq_s2_prescale_x(t, x, x_type), dst, ith, nth);
@@ -708,24 +705,18 @@ void ggml_pq_node_boundary(const void * node_ptr, int ith, int nth, void * threa
     if (!g_pq_enabled.load(std::memory_order_relaxed) || g_pq.empty()) {
         return;
     }
-    if (ith >= kMaxThreads) {
-        return;
-    }
     const struct ggml_tensor * node = (const struct ggml_tensor *) node_ptr;
     if (node && pq_node_is_decode_mul_mat(node) && g_pq.count(node->src[0]->name)) {
         return;
     }
-    pq_s1_flush(g_s1_group[ith], ith, nth, threadpool, true);
+    pq_s1_flush(g_s1_tls, ith, nth, threadpool, true);
 }
 
 void ggml_pq_graph_end(int ith, int nth, void * threadpool) {
     if (!g_pq_enabled.load(std::memory_order_relaxed)) {
         return;
     }
-    if (ith >= kMaxThreads) {
-        return;
-    }
-    pq_s1_flush(g_s1_group[ith], ith, nth, threadpool, true);
+    pq_s1_flush(g_s1_tls, ith, nth, threadpool, true);
 }
 
 bool ggml_pq_register_group(const char * name, int64_t n_in, int64_t n_out_total,

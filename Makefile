@@ -327,7 +327,9 @@ chat: prepare-chat-model llama-build
 		--max-tokens "$(CHAT_MAX_TOKENS)" --system "$(CHAT_SYSTEM)"
 
 selftest: llama-build
-	"$(LLAMA_BUILD)/bin/pq-selftest"
+	env -u GGML_NODE_TIMING -u GGML_PQ_DISABLE_ATTN -u GGML_PQ_DISABLE_FFN \
+		-u GGML_PQ_DISABLE_S1 -u GGML_PQ_DISABLE_S2 -u GGML_PQ_NO_FUSE -u GGML_PQ_NO_QKV \
+		"$(LLAMA_BUILD)/bin/pq-selftest"
 	@echo "[OK] PQ correctness self-test passed"
 
 smoke: check-benchmark-inputs llama_pq

@@ -1,4 +1,4 @@
-// Numeric self-test for the PQ decode GEMV path (S1 fusion + S2 direct GEMV).
+// Numeric self-test for the PQ decode GEMV path (S1 + S2).
 // Compares PQ outputs against an fp32 reference on the active CPU backend
 // (AVX-512 on x86, NEON on aarch64 / Kunpeng).
 #include "ggml.h"
@@ -12,6 +12,93 @@
 #include <random>
 #include <vector>
 
+static void pq_clear_disable_env(void) {
+    unsetenv("GGML_PQ_DISABLE_S1");
+    unsetenv("GGML_PQ_DISABLE_S2");
+    unsetenv("GGML_PQ_DISABLE_ATTN");
+    unsetenv("GGML_PQ_DISABLE_FFN");
+    unsetenv("GGML_PQ_NO_FUSE");
+    unsetenv("GGML_PQ_NO_QKV");
+}
+
+static double rel_mse(const float * y, const float * ref, int n) {
+    double se = 0, sr = 0;
+    for (int j = 0; j < n; j++) {
+        const double e = (double) y[j] - (double) ref[j];
+        se += e * e;
+        sr += (double) ref[j] * (double) ref[j];
+    }
+    return sr > 0 ? se / sr : 0.0;
+}
+
+// Direct S1 GEMV (no graph / no fusion) — isolates the NEON LUT path.
+static int test_s1_direct(int n_in, int n_out) {
+    const int ds = 2;
+    const int M  = n_in / ds;
+
+    std::mt19937 rng(1234);
+    std::uniform_real_distribution<float> u(-1.f, 1.f);
+    std::uniform_int_distribution<int> ui(0, GGML_PQ_K - 1);
+
+    std::vector<ggml_fp16_t> cb((size_t) M * ds * GGML_PQ_K);
+    std::vector<uint8_t> idx((size_t) M * n_out);
+    std::vector<float> x(n_in);
+    for (auto & v : x) {
+        v = u(rng);
+    }
+    for (auto & v : cb) {
+        v = ggml_fp32_to_fp16(u(rng));
+    }
+    for (auto & v : idx) {
+        v = (uint8_t) ui(rng);
+    }
+
+    ggml_pq_reset();
+    if (!ggml_pq_register_raw("test.s1", /*mode=*/0, ds, cb.data(), nullptr,
+                              idx.data(), n_in, n_out)) {
+        fprintf(stderr, "S1 direct: register failed\n");
+        return 1;
+    }
+    ggml_pq_set_enabled(true);
+
+    // Reference matches the kernel's int8 dt quantization.
+    std::vector<float> ref(n_out, 0.f);
+    for (int i = 0; i < M; i++) {
+        float dt[GGML_PQ_K];
+        float amax = 0.f;
+        for (int k = 0; k < GGML_PQ_K; k++) {
+            float s = 0.f;
+            for (int d = 0; d < ds; d++) {
+                s += x[(size_t) i * ds + d] *
+                     ggml_fp16_to_fp32(cb[((size_t)(i * ds + d)) * GGML_PQ_K + k]);
+            }
+            dt[k] = s;
+            amax = std::max(amax, std::fabs(s));
+        }
+        const float inv = amax > 0.f ? amax / 127.0f : 0.f;
+        const float sc  = amax > 0.f ? 127.0f / amax : 0.f;
+        int8_t dt8[GGML_PQ_K];
+        for (int k = 0; k < GGML_PQ_K; k++) {
+            dt8[k] = amax > 0.f ? (int8_t) std::lround(dt[k] * sc) : 0;
+        }
+        for (int j = 0; j < n_out; j++) {
+            ref[j] += (float) dt8[idx[(size_t) i * n_out + j]] * inv;
+        }
+    }
+
+    std::vector<float> y(n_out, 0.f);
+    if (!ggml_pq_mul_mat_vec("test.s1", x.data(), /*F32*/0, y.data(),
+                             n_in, n_out, /*ith=*/0, /*nth=*/1, nullptr)) {
+        fprintf(stderr, "S1 direct: mul_mat_vec failed (PQ path not taken)\n");
+        return 1;
+    }
+
+    const double rel = rel_mse(y.data(), ref.data(), n_out);
+    printf("S1 direct: rel_mse=%.3e  y[0..3]=%.3f %.3f %.3f %.3f  ref=%.3f %.3f %.3f %.3f\n",
+           rel, y[0], y[1], y[2], y[3], ref[0], ref[1], ref[2], ref[3]);
+    return (rel > 0.05 || !std::isfinite(y[0])) ? 1 : 0;
+}
+
 static int test_s1_fusion(int nth, int n_in, int n_out) {
     const int ds = 2;
     const int M  = n_in / ds;
@@ -24,12 +111,18 @@ static int test_s1_fusion(int nth, int n_in, int n_out) {
     std::vector<std::vector<ggml_fp16_t>> cb(NT);
     std::vector<std::vector<uint8_t>>  idx(NT);
     std::vector<float> x(n_in);
-    for (auto & v : x) v = u(rng);
+    for (auto & v : x) {
+        v = u(rng);
+    }
     for (int t = 0; t < NT; t++) {
         cb[t].resize((size_t) M * ds * GGML_PQ_K);
-        for (auto & v : cb[t]) v = ggml_fp32_to_fp16(u(rng));
+        for (auto & v : cb[t]) {
+            v = ggml_fp32_to_fp16(u(rng));
+        }
         idx[t].resize((size_t) M * n_out);
-        for (auto & v : idx[t]) v = (uint8_t) ui(rng);
+        for (auto & v : idx[t]) {
+            v = (uint8_t) ui(rng);
+        }
     }
 
     ggml_pq_reset();
@@ -38,12 +131,13 @@ static int test_s1_fusion(int nth, int n_in, int n_out) {
         snprintf(nm, sizeof(nm), "test.w%d", t);
         if (!ggml_pq_register_raw(nm, /*mode=*/0, ds, cb[t].data(), nullptr,
                                   idx[t].data(), n_in, n_out)) {
-            fprintf(stderr, "S1 register failed\n");
+            fprintf(stderr, "S1 fusion: register failed\n");
             return 1;
         }
     }
     ggml_pq_set_enabled(true);
 
+    // Approximate fp32 reference (kernel uses int8 dt; allow looser tol).
     std::vector<std::vector<float>> ref(NT, std::vector<float>(n_out, 0.f));
     for (int t = 0; t < NT; t++) {
         for (int i = 0; i < M; i++) {
@@ -52,7 +146,7 @@ static int test_s1_fusion(int nth, int n_in, int n_out) {
                 float s = 0.f;
                 for (int d = 0; d < ds; d++) {
                     s += x[(size_t) i * ds + d] *
-                         (float) cb[t][((size_t)(i * ds + d)) * GGML_PQ_K + k];
+                         ggml_fp16_to_fp32(cb[t][((size_t)(i * ds + d)) * GGML_PQ_K + k]);
                 }
                 dt[k] = s;
             }
@@ -68,6 +162,17 @@ static int test_s1_fusion(int nth, int n_in, int n_out) {
     ggml_set_name(w0, "test.w0");
     struct ggml_tensor * w1 = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, n_in, n_out);
     ggml_set_name(w1, "test.w1");
+    // Fill weights with NaNs so a missed PQ intercept cannot silently look like zeros.
+    {
+        const size_t n = (size_t) n_in * (size_t) n_out;
+        auto * p0 = (ggml_fp16_t *) w0->data;
+        auto * p1 = (ggml_fp16_t *) w1->data;
+        const ggml_fp16_t nan16 = ggml_fp32_to_fp16(NAN);
+        for (size_t i = 0; i < n; i++) {
+            p0[i] = nan16;
+            p1[i] = nan16;
+        }
+    }
     struct ggml_tensor * xin = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_in, 1);
     memcpy(xin->data, x.data(), n_in * sizeof(float));
 
@@ -82,9 +187,11 @@ static int test_s1_fusion(int nth, int n_in, int n_out) {
     ggml_build_forward_expand(gf, zsum);
 
     struct ggml_cplan plan = ggml_graph_plan(gf, nth, nullptr);
-    plan.work_data = (uint8_t *) malloc(plan.work_size);
+    plan.work_data = plan.work_size ? (uint8_t *) malloc(plan.work_size) : nullptr;
     if (ggml_graph_compute(gf, &plan) != GGML_STATUS_SUCCESS) {
-        fprintf(stderr, "S1 compute failed\n");
+        fprintf(stderr, "S1 fusion: compute failed\n");
+        free(plan.work_data);
+        ggml_free(ctx);
         return 1;
     }
 
@@ -92,29 +199,20 @@ static int test_s1_fusion(int nth, int n_in, int n_out) {
     const struct ggml_tensor * ys[NT] = { y0, y1 };
     {
         const float * z = (const float *) zsum->data;
-        double se = 0, sr = 0;
+        std::vector<float> zref(n_out);
         for (int j = 0; j < n_out; j++) {
-            const double r = ref[0][j] + ref[1][j];
-            const double e = z[j] - r;
-            se += e * e;
-            sr += r * r;
+            zref[j] = ref[0][j] + ref[1][j];
         }
-        const double rel = sr > 0 ? se / sr : 0.0;
-        printf("S1 zsum: rel_mse=%.3e\n", rel);
-        if (rel > 0.05) {
+        const double rel = rel_mse(z, zref.data(), n_out);
+        printf("S1 fusion zsum: rel_mse=%.3e  z[0]=%.3f ref[0]=%.3f\n", rel, z[0], zref[0]);
+        if (rel > 0.05 || !std::isfinite(z[0])) {
             bad = 1;
         }
     }
     for (int t = 0; t < NT; t++) {
         const float * y = (const float *) ys[t]->data;
-        double se = 0, sr = 0;
-        for (int j = 0; j < n_out; j++) {
-            const double e = y[j] - ref[t][j];
-            se += e * e;
-            sr += (double) ref[t][j] * ref[t][j];
-        }
-        const double rel = sr > 0 ? se / sr : 0;
-        printf("S1 w%d: rel_mse=%.3e\n", t, rel);
+        const double rel = rel_mse(y, ref[t].data(), n_out);
+        printf("S1 fusion w%d: rel_mse=%.3e  y[0]=%.3f ref[0]=%.3f\n", t, rel, y[0], ref[t][0]);
         if (rel > 0.05 || !std::isfinite(y[0])) {
             bad = 1;
         }
@@ -124,7 +222,6 @@ static int test_s1_fusion(int nth, int n_in, int n_out) {
     return bad;
 }
 
-// Direct S2 GEMV vs fp32 reference (covers NEON 256-entry LUT on aarch64).
 static int test_s2_direct(int nth, int n_in, int n_out) {
     const int ds = 2;
     if (n_out % ds != 0) {
@@ -185,35 +282,29 @@ static int test_s2_direct(int nth, int n_in, int n_out) {
         }
     }
 
-    double se = 0, sr = 0;
-    for (int j = 0; j < n_out; j++) {
-        const double e = y[j] - ref[j];
-        se += e * e;
-        sr += (double) ref[j] * ref[j];
-    }
-    const double rel = sr > 0 ? se / sr : 0;
-    printf("S2: rel_mse=%.3e  y[0..3]=%.3f %.3f %.3f %.3f  ref=%.3f %.3f %.3f %.3f\n",
+    const double rel = rel_mse(y.data(), ref.data(), n_out);
+    printf("S2 direct: rel_mse=%.3e  y[0..3]=%.3f %.3f %.3f %.3f  ref=%.3f %.3f %.3f %.3f\n",
            rel, y[0], y[1], y[2], y[3], ref[0], ref[1], ref[2], ref[3]);
-    if (rel > 0.05 || !std::isfinite(y[0])) {
-        return 1;
-    }
-    return 0;
+    return (rel > 0.05 || !std::isfinite(y[0])) ? 1 : 0;
 }
 
 int main(int argc, char ** argv) {
+    pq_clear_disable_env();
+
     const int nth   = argc > 1 ? atoi(argv[1]) : 8;
     const int n_in  = argc > 2 ? atoi(argv[2]) : 512;
     const int n_out = argc > 3 ? atoi(argv[3]) : 256;
 
 #if defined(__aarch64__)
-    printf("pq-selftest: aarch64 / Kunpeng NEON path\n");
+    printf("pq-selftest: aarch64 / Kunpeng NEON path (nth=%d)\n", nth);
 #elif defined(__AVX512FP16__) && defined(__AVX512VBMI__)
-    printf("pq-selftest: x86 AVX-512 FP16+VBMI path\n");
+    printf("pq-selftest: x86 AVX-512 FP16+VBMI path (nth=%d)\n", nth);
 #else
-    printf("pq-selftest: host has no optimized PQ ISA; stubs may no-op\n");
+    printf("pq-selftest: host has no optimized PQ ISA; stubs may no-op (nth=%d)\n", nth);
 #endif
 
     int bad = 0;
+    bad |= test_s1_direct(n_in, n_out);
     bad |= test_s1_fusion(nth, n_in, n_out);
     bad |= test_s2_direct(nth, n_in, n_out);
     printf(bad ? "FAIL\n" : "PASS\n");

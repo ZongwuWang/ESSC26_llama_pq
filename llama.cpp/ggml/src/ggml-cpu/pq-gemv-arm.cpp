@@ -1,8 +1,9 @@
 // PQ decode-time GEMV for ARM64 (Huawei Kunpeng / aarch64).
 //
 // Mirrors the public ggml_pq_* API in pq-gemv.cpp (AVX-512 x86 path).
-// Hot path uses NEON 256-entry byte LUT (+ optional SDOT). SVE is reserved
-// for a later width-specialized kernel; ggml's own SVE paths remain unchanged.
+// Hot path: NEON 256-entry byte LUT + SDOT when available.
+// S1 (EdgePQ-4c8b, ds=4): float32 partials, vectorized dt build, 4-subspace
+// blocked accumulate (avoids per-output fp16<->f32 round-trips).
 #include "ggml-pq.h"
 
 #if defined(__aarch64__)
@@ -549,8 +550,8 @@ static void pq_s1_flush(S1Group & g, int ith, int nth, void * threadpool, bool s
         const int M = (int) (tm.n_in / tm.ds);
         const int a0 = (int) ((int64_t) M * ith / nth);
         const int a1 = (int) ((int64_t) M * (ith + 1) / nth);
-        pq_f16 * my = g_s1_partials.data() + base[m] + (size_t) ith * tm.n_out;
-        std::fill(my, my + tm.n_out, pq_from_f32(0.f));
+        float * my = g_s1_partials.data() + base[m] + (size_t) ith * tm.n_out;
+        std::fill(my, my + tm.n_out, 0.f);
         if (a1 > a0) {
             pq_s1_phase1(tm, g.xh[m], a0, a1, my);
         }
@@ -660,7 +661,7 @@ bool ggml_pq_register(const char * name, int mode, int ds,
         std::lock_guard<std::mutex> lk(g_s1_mu);
         const size_t want = 4 * kMaxThreads * (size_t) n_out;
         if (g_s1_partials.size() < want) {
-            g_s1_partials.assign(want, pq_from_f32(0.f));
+            g_s1_partials.assign(want, 0.f);
         }
     }
     return true;
@@ -698,7 +699,7 @@ bool ggml_pq_register_raw(const char * name, int mode, int ds, const void * cb,
         std::lock_guard<std::mutex> lk(g_s1_mu);
         const size_t want = 4 * kMaxThreads * (size_t) n_out;
         if (g_s1_partials.size() < want) {
-            g_s1_partials.assign(want, pq_from_f32(0.f));
+            g_s1_partials.assign(want, 0.f);
         }
     }
     return true;
@@ -725,7 +726,7 @@ bool ggml_pq_register_raw_scaled(const char * name, int ds, const void * cb,
     std::lock_guard<std::mutex> lk(g_s1_mu);
     const size_t want = 4 * kMaxThreads * (size_t) n_out;
     if (g_s1_partials.size() < want) {
-        g_s1_partials.assign(want, pq_from_f32(0.f));
+        g_s1_partials.assign(want, 0.f);
     }
     return true;
 }

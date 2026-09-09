@@ -1,14 +1,16 @@
 // PQ decode-time GEMV for ARM64 (Huawei Kunpeng / aarch64).
 //
 // Mirrors the public ggml_pq_* API in pq-gemv.cpp (AVX-512 x86 path).
-// Hot path: NEON 256-entry byte LUT + SDOT when available.
-// S1 (EdgePQ-4c8b, ds=4): float32 partials, vectorized dt build, 4-subspace
-// blocked accumulate (avoids per-output fp16<->f32 round-trips).
+// S1 (EdgePQ-4c8b, ds=4): 4-subspace yl amortization, fp16 FMA accumulate,
+// fused build+quantize, register-resident 256-LUT, software prefetch.
 #include "ggml-pq.h"
 
 #if defined(__aarch64__)
 
 #include <arm_neon.h>
+#if defined(__ARM_FEATURE_SVE)
+#include <arm_sve.h>
+#endif
 #include <sys/mman.h>
 #include <algorithm>
 #include <atomic>
@@ -99,7 +101,8 @@ std::atomic<bool> g_pq_enabled{false};
 
 constexpr int kMaxThreads = 1024; // Kunpeng nodes can expose 640+ logical CPUs
 
-std::vector<float> g_s1_partials; // float32 partials: avoids fp16<->f32 in the LUT loop
+// fp16 partials (matches x86): halves phase2 reduce traffic vs float32.
+std::vector<pq_f16> g_s1_partials;
 std::mutex          g_s1_mu;
 
 struct MulmatAcc { uint64_t busy_us = 0, count = 0; };
@@ -107,8 +110,6 @@ static std::map<std::string, MulmatAcc> g_mulmat_acc;
 static std::mutex g_mulmat_mu;
 
 static inline void pq_barrier(void * threadpool, int nth) {
-    // OpenMP/ggml barriers require a live pool and >1 participants. Never
-    // dereference a null threadpool (direct mul_mat_vec unit tests).
     if (nth <= 1 || threadpool == nullptr) {
         return;
     }
@@ -116,32 +117,39 @@ static inline void pq_barrier(void * threadpool, int nth) {
 }
 
 // ---------------------------------------------------------------------------
-// NEON helpers: true 256-entry byte LUT (vqtbl1 alone only covers 16 entries).
-// Four vqtbl4q tables cover bytes [0,64), [64,128), [128,192), [192,256).
-// Out-of-range lanes are zeroed by the table instruction, so OR merges safely.
+// NEON 256-entry byte LUT. Four vqtbl4q cover [0,256).
 // ---------------------------------------------------------------------------
-static inline uint8x16_t pq_neon_tbl256(const uint8_t * table, uint8x16_t idx) {
-    const uint8x16x4_t t0 = vld1q_u8_x4(table + 0);
-    const uint8x16x4_t t1 = vld1q_u8_x4(table + 64);
-    const uint8x16x4_t t2 = vld1q_u8_x4(table + 128);
-    const uint8x16x4_t t3 = vld1q_u8_x4(table + 192);
-    const uint8x16_t r0 = vqtbl4q_u8(t0, idx);
-    const uint8x16_t r1 = vqtbl4q_u8(t1, vsubq_u8(idx, vdupq_n_u8(64)));
-    const uint8x16_t r2 = vqtbl4q_u8(t2, vsubq_u8(idx, vdupq_n_u8(128)));
-    const uint8x16_t r3 = vqtbl4q_u8(t3, vsubq_u8(idx, vdupq_n_u8(192)));
-    return vorrq_u8(vorrq_u8(r0, r1), vorrq_u8(r2, r3));
+struct PqLut256 {
+    uint8x16x4_t t0, t1, t2, t3;
+};
+
+static inline PqLut256 pq_lut256_load(const int8_t * table) {
+    const uint8_t * u = (const uint8_t *) table;
+    PqLut256 L;
+    L.t0 = vld1q_u8_x4(u + 0);
+    L.t1 = vld1q_u8_x4(u + 64);
+    L.t2 = vld1q_u8_x4(u + 128);
+    L.t3 = vld1q_u8_x4(u + 192);
+    return L;
 }
 
-static inline int8x16_t pq_neon_tbl256_s8(const int8_t * table, uint8x16_t idx) {
-    return vreinterpretq_s8_u8(pq_neon_tbl256((const uint8_t *) table, idx));
+__attribute__((always_inline))
+static inline int8x16_t pq_lut256_lookup(const PqLut256 & L, uint8x16_t idx) {
+    const uint8x16_t r0 = vqtbl4q_u8(L.t0, idx);
+    const uint8x16_t r1 = vqtbl4q_u8(L.t1, vsubq_u8(idx, vdupq_n_u8(64)));
+    const uint8x16_t r2 = vqtbl4q_u8(L.t2, vsubq_u8(idx, vdupq_n_u8(128)));
+    const uint8x16_t r3 = vqtbl4q_u8(L.t3, vsubq_u8(idx, vdupq_n_u8(192)));
+    return vreinterpretq_s8_u8(vorrq_u8(vorrq_u8(r0, r1), vorrq_u8(r2, r3)));
 }
+
+static inline void pq_prefetch_t0(const void * p) { __builtin_prefetch(p, 0, 3); }
+static inline void pq_prefetch_t1(const void * p) { __builtin_prefetch(p, 0, 2); }
 
 #if defined(__ARM_FEATURE_DOTPROD)
 static inline int32x4_t pq_neon_sdot(int32x4_t acc, int8x16_t a, int8x16_t b) {
     return vdotq_s32(acc, a, b);
 }
 #else
-// Portable fallback: signed int8 x signed int8 -> int32 accumulate (16 lanes).
 static inline int32x4_t pq_neon_sdot(int32x4_t acc, int8x16_t a, int8x16_t b) {
     const int16x8_t al = vmovl_s8(vget_low_s8(a));
     const int16x8_t ah = vmovl_high_s8(a);
@@ -166,6 +174,45 @@ static inline float32x4_t pq_load_f16x4(const pq_f16 * p) {
 #endif
 }
 
+#if defined(__ARM_FEATURE_FP16_VECTOR_ARITHMETIC)
+__attribute__((always_inline))
+static inline void pq_i8_to_f16x8x2(int8x16_t qv, float16x8_t & lo, float16x8_t & hi) {
+    const int16x8_t qlo = vmovl_s8(vget_low_s8(qv));
+    const int16x8_t qhi = vmovl_high_s8(qv);
+    const float16x4_t a = vcvt_f16_f32(vcvtq_f32_s32(vmovl_s16(vget_low_s16(qlo))));
+    const float16x4_t b = vcvt_f16_f32(vcvtq_f32_s32(vmovl_high_s16(qlo)));
+    const float16x4_t c = vcvt_f16_f32(vcvtq_f32_s32(vmovl_s16(vget_low_s16(qhi))));
+    const float16x4_t d = vcvt_f16_f32(vcvtq_f32_s32(vmovl_high_s16(qhi)));
+    lo = vcombine_f16(a, b);
+    hi = vcombine_f16(c, d);
+}
+
+__attribute__((always_inline))
+static inline void pq_fma_lut16_f16(float16x8_t & y0, float16x8_t & y1,
+                                    const PqLut256 & L, const uint8_t * ii,
+                                    float16_t inv) {
+    const int8x16_t qv = pq_lut256_lookup(L, vld1q_u8(ii));
+    float16x8_t lo, hi;
+    pq_i8_to_f16x8x2(qv, lo, hi);
+    y0 = vfmaq_n_f16(y0, lo, inv);
+    y1 = vfmaq_n_f16(y1, hi, inv);
+}
+#endif
+
+__attribute__((always_inline))
+static inline void pq_fma_lut16_f32(float32x4_t & y0, float32x4_t & y1,
+                                    float32x4_t & y2, float32x4_t & y3,
+                                    const PqLut256 & L, const uint8_t * ii,
+                                    float inv) {
+    const int8x16_t qv = pq_lut256_lookup(L, vld1q_u8(ii));
+    const int16x8_t qlo = vmovl_s8(vget_low_s8(qv));
+    const int16x8_t qhi = vmovl_high_s8(qv);
+    y0 = vfmaq_n_f32(y0, vcvtq_f32_s32(vmovl_s16(vget_low_s16(qlo))), inv);
+    y1 = vfmaq_n_f32(y1, vcvtq_f32_s32(vmovl_high_s16(qlo)), inv);
+    y2 = vfmaq_n_f32(y2, vcvtq_f32_s32(vmovl_s16(vget_low_s16(qhi))), inv);
+    y3 = vfmaq_n_f32(y3, vcvtq_f32_s32(vmovl_high_s16(qhi)), inv);
+}
+
 static void pq_build_dt_scalar(int ds, const pq_f16 * xh, const pq_f16 * cbh,
                                int subspace, float * dt) {
     for (int k = 0; k < GGML_PQ_K; k++) {
@@ -175,26 +222,6 @@ static void pq_build_dt_scalar(int ds, const pq_f16 * xh, const pq_f16 * cbh,
                  pq_to_f32(cbh[((size_t)(subspace * ds + d) * GGML_PQ_K) + k]);
         }
         dt[k] = s;
-    }
-}
-
-// EdgePQ-4c8b hot path: ds=4, codebook SoA layout [(i*4+d)*K + k].
-static void pq_build_dt_ds4(const pq_f16 * xh, const pq_f16 * cbh,
-                            int subspace, float * dt) {
-    const float32x4_t vx0 = vdupq_n_f32(pq_to_f32(xh[(size_t) subspace * 4 + 0]));
-    const float32x4_t vx1 = vdupq_n_f32(pq_to_f32(xh[(size_t) subspace * 4 + 1]));
-    const float32x4_t vx2 = vdupq_n_f32(pq_to_f32(xh[(size_t) subspace * 4 + 2]));
-    const float32x4_t vx3 = vdupq_n_f32(pq_to_f32(xh[(size_t) subspace * 4 + 3]));
-    const pq_f16 * c0 = cbh + (size_t) (subspace * 4 + 0) * GGML_PQ_K;
-    const pq_f16 * c1 = cbh + (size_t) (subspace * 4 + 1) * GGML_PQ_K;
-    const pq_f16 * c2 = cbh + (size_t) (subspace * 4 + 2) * GGML_PQ_K;
-    const pq_f16 * c3 = cbh + (size_t) (subspace * 4 + 3) * GGML_PQ_K;
-    for (int k = 0; k < GGML_PQ_K; k += 4) {
-        float32x4_t v = vmulq_f32(vx0, pq_load_f16x4(c0 + k));
-        v = vfmaq_f32(v, vx1, pq_load_f16x4(c1 + k));
-        v = vfmaq_f32(v, vx2, pq_load_f16x4(c2 + k));
-        v = vfmaq_f32(v, vx3, pq_load_f16x4(c3 + k));
-        vst1q_f32(dt + k, v);
     }
 }
 
@@ -210,124 +237,246 @@ static void pq_quantize_dt(const float * dt, int8_t * dt8, float * inv_out) {
         return;
     }
     *inv_out = amax / 127.0f;
-    const float sc = 127.0f / amax;
-    const float32x4_t vsc = vdupq_n_f32(sc);
+    const float32x4_t vsc = vdupq_n_f32(127.0f / amax);
     for (int k = 0; k < GGML_PQ_K; k += 16) {
-        float32x4_t f0 = vmulq_f32(vld1q_f32(dt + k + 0), vsc);
-        float32x4_t f1 = vmulq_f32(vld1q_f32(dt + k + 4), vsc);
-        float32x4_t f2 = vmulq_f32(vld1q_f32(dt + k + 8), vsc);
-        float32x4_t f3 = vmulq_f32(vld1q_f32(dt + k + 12), vsc);
-        // round-to-nearest via +0.5 with sign handling is awkward; use scalar
-        // for 16 lanes — still far cheaper than the old per-output fp16 path.
-        float tmp[16];
-        vst1q_f32(tmp + 0, f0);
-        vst1q_f32(tmp + 4, f1);
-        vst1q_f32(tmp + 8, f2);
-        vst1q_f32(tmp + 12, f3);
-        for (int t = 0; t < 16; t++) {
-            dt8[k + t] = (int8_t) std::lround(tmp[t]);
-        }
+        const int32x4_t i0 = vcvtnq_s32_f32(vmulq_f32(vld1q_f32(dt + k + 0), vsc));
+        const int32x4_t i1 = vcvtnq_s32_f32(vmulq_f32(vld1q_f32(dt + k + 4), vsc));
+        const int32x4_t i2 = vcvtnq_s32_f32(vmulq_f32(vld1q_f32(dt + k + 8), vsc));
+        const int32x4_t i3 = vcvtnq_s32_f32(vmulq_f32(vld1q_f32(dt + k + 12), vsc));
+        const int16x8_t p01 = vcombine_s16(vqmovn_s32(i0), vqmovn_s32(i1));
+        const int16x8_t p23 = vcombine_s16(vqmovn_s32(i2), vqmovn_s32(i3));
+        vst1q_s8(dt8 + k, vcombine_s8(vqmovn_s16(p01), vqmovn_s16(p23)));
     }
 }
 
-static inline void pq_acc_lut16(float * yl, const uint8_t * ii, const int8_t * dt8,
-                                float inv) {
-    const uint8x16_t iv = vld1q_u8(ii);
-    const int8x16_t qv = pq_neon_tbl256_s8(dt8, iv);
-    const int16x8_t qlo = vmovl_s8(vget_low_s8(qv));
-    const int16x8_t qhi = vmovl_high_s8(qv);
-    float32x4_t f0 = vcvtq_f32_s32(vmovl_s16(vget_low_s16(qlo)));
-    float32x4_t f1 = vcvtq_f32_s32(vmovl_high_s16(qlo));
-    float32x4_t f2 = vcvtq_f32_s32(vmovl_s16(vget_low_s16(qhi)));
-    float32x4_t f3 = vcvtq_f32_s32(vmovl_high_s16(qhi));
-    float32x4_t y0 = vld1q_f32(yl + 0);
-    float32x4_t y1 = vld1q_f32(yl + 4);
-    float32x4_t y2 = vld1q_f32(yl + 8);
-    float32x4_t y3 = vld1q_f32(yl + 12);
-    y0 = vfmaq_n_f32(y0, f0, inv);
-    y1 = vfmaq_n_f32(y1, f1, inv);
-    y2 = vfmaq_n_f32(y2, f2, inv);
-    y3 = vfmaq_n_f32(y3, f3, inv);
-    vst1q_f32(yl + 0, y0);
-    vst1q_f32(yl + 4, y1);
-    vst1q_f32(yl + 8, y2);
-    vst1q_f32(yl + 12, y3);
+// Build dt[256] + quantize; absmax tracked during the build pass.
+static void pq_build_quant_ds4(const pq_f16 * xh, const pq_f16 * cbh,
+                               int subspace, int8_t * dt8, float * inv_out) {
+    const float32x4_t vx0 = vdupq_n_f32(pq_to_f32(xh[(size_t) subspace * 4 + 0]));
+    const float32x4_t vx1 = vdupq_n_f32(pq_to_f32(xh[(size_t) subspace * 4 + 1]));
+    const float32x4_t vx2 = vdupq_n_f32(pq_to_f32(xh[(size_t) subspace * 4 + 2]));
+    const float32x4_t vx3 = vdupq_n_f32(pq_to_f32(xh[(size_t) subspace * 4 + 3]));
+    const pq_f16 * c0 = cbh + (size_t) (subspace * 4 + 0) * GGML_PQ_K;
+    const pq_f16 * c1 = cbh + (size_t) (subspace * 4 + 1) * GGML_PQ_K;
+    const pq_f16 * c2 = cbh + (size_t) (subspace * 4 + 2) * GGML_PQ_K;
+    const pq_f16 * c3 = cbh + (size_t) (subspace * 4 + 3) * GGML_PQ_K;
+
+    alignas(16) float dt[GGML_PQ_K];
+    float32x4_t vmax = vdupq_n_f32(0.f);
+    for (int k = 0; k < GGML_PQ_K; k += 8) {
+        float32x4_t v0 = vmulq_f32(vx0, pq_load_f16x4(c0 + k));
+        v0 = vfmaq_f32(v0, vx1, pq_load_f16x4(c1 + k));
+        v0 = vfmaq_f32(v0, vx2, pq_load_f16x4(c2 + k));
+        v0 = vfmaq_f32(v0, vx3, pq_load_f16x4(c3 + k));
+        float32x4_t v1 = vmulq_f32(vx0, pq_load_f16x4(c0 + k + 4));
+        v1 = vfmaq_f32(v1, vx1, pq_load_f16x4(c1 + k + 4));
+        v1 = vfmaq_f32(v1, vx2, pq_load_f16x4(c2 + k + 4));
+        v1 = vfmaq_f32(v1, vx3, pq_load_f16x4(c3 + k + 4));
+        vst1q_f32(dt + k, v0);
+        vst1q_f32(dt + k + 4, v1);
+        vmax = vmaxq_f32(vmax, vabsq_f32(v0));
+        vmax = vmaxq_f32(vmax, vabsq_f32(v1));
+    }
+    const float amax = vmaxvq_f32(vmax);
+    if (!(amax > 0.f)) {
+        memset(dt8, 0, GGML_PQ_K);
+        *inv_out = 0.f;
+        return;
+    }
+    *inv_out = amax / 127.0f;
+    const float32x4_t vsc = vdupq_n_f32(127.0f / amax);
+    for (int k = 0; k < GGML_PQ_K; k += 16) {
+        const int32x4_t i0 = vcvtnq_s32_f32(vmulq_f32(vld1q_f32(dt + k + 0), vsc));
+        const int32x4_t i1 = vcvtnq_s32_f32(vmulq_f32(vld1q_f32(dt + k + 4), vsc));
+        const int32x4_t i2 = vcvtnq_s32_f32(vmulq_f32(vld1q_f32(dt + k + 8), vsc));
+        const int32x4_t i3 = vcvtnq_s32_f32(vmulq_f32(vld1q_f32(dt + k + 12), vsc));
+        const int16x8_t p01 = vcombine_s16(vqmovn_s32(i0), vqmovn_s32(i1));
+        const int16x8_t p23 = vcombine_s16(vqmovn_s32(i2), vqmovn_s32(i3));
+        vst1q_s8(dt8 + k, vcombine_s8(vqmovn_s16(p01), vqmovn_s16(p23)));
+    }
 }
 
 static void pq_s1_accumulate_subspace(const PQTensor & t, const pq_f16 * xh,
-                                      int subspace, float * yl) {
+                                      int subspace, pq_f16 * yl) {
     const int ds = t.ds;
     const int dout = (int) t.n_out;
     const pq_f16 * cbh = t.cbh.data();
     const uint8_t * idx = t.idx.data();
 
-    float dt[GGML_PQ_K];
-    if (ds == 4) {
-        pq_build_dt_ds4(xh, cbh, subspace, dt);
-    } else {
-        pq_build_dt_scalar(ds, xh, cbh, subspace, dt);
-    }
-
-    int8_t dt8[GGML_PQ_K];
+    alignas(16) int8_t dt8[GGML_PQ_K];
     float inv = 0.f;
-    pq_quantize_dt(dt, dt8, &inv);
-
-    const uint8_t * ii = idx + (size_t) subspace * dout;
-    int j = 0;
-    for (; j + 15 < dout; j += 16) {
-        pq_acc_lut16(yl + j, ii + j, dt8, inv);
+    if (ds == 4) {
+        pq_build_quant_ds4(xh, cbh, subspace, dt8, &inv);
+    } else {
+        float dt[GGML_PQ_K];
+        pq_build_dt_scalar(ds, xh, cbh, subspace, dt);
+        pq_quantize_dt(dt, dt8, &inv);
     }
+    const PqLut256 L = pq_lut256_load(dt8);
+    const uint8_t * ii = idx + (size_t) subspace * dout;
+
+    int j = 0;
+#if defined(__ARM_FEATURE_FP16_VECTOR_ARITHMETIC)
+    const float16_t hinv = (float16_t) inv;
+    for (; j + 15 < dout; j += 16) {
+        if (j + 128 < dout) {
+            pq_prefetch_t0(ii + j + 128);
+        }
+        float16x8_t y0 = vld1q_f16((const __fp16 *) (yl + j));
+        float16x8_t y1 = vld1q_f16((const __fp16 *) (yl + j + 8));
+        pq_fma_lut16_f16(y0, y1, L, ii + j, hinv);
+        vst1q_f16((__fp16 *) (yl + j), y0);
+        vst1q_f16((__fp16 *) (yl + j + 8), y1);
+    }
+#else
+    for (; j + 15 < dout; j += 16) {
+        if (j + 128 < dout) {
+            pq_prefetch_t0(ii + j + 128);
+        }
+        float tmp[16];
+        for (int t = 0; t < 16; t++) {
+            tmp[t] = pq_to_f32(yl[j + t]);
+        }
+        float32x4_t y0 = vld1q_f32(tmp + 0);
+        float32x4_t y1 = vld1q_f32(tmp + 4);
+        float32x4_t y2 = vld1q_f32(tmp + 8);
+        float32x4_t y3 = vld1q_f32(tmp + 12);
+        pq_fma_lut16_f32(y0, y1, y2, y3, L, ii + j, inv);
+        vst1q_f32(tmp + 0, y0);
+        vst1q_f32(tmp + 4, y1);
+        vst1q_f32(tmp + 8, y2);
+        vst1q_f32(tmp + 12, y3);
+        for (int t = 0; t < 16; t++) {
+            yl[j + t] = pq_from_f32(tmp[t]);
+        }
+    }
+#endif
     for (; j < dout; j++) {
-        yl[j] += (float) dt8[ii[j]] * inv;
+        yl[j] = pq_from_f32(pq_to_f32(yl[j]) + (float) dt8[ii[j]] * inv);
     }
 }
 
-// Process 4 subspaces per yl sweep (matches x86 pq_s1_phase1_ds4_block intent).
-static void pq_s1_phase1_ds4(const PQTensor & t, const pq_f16 * xh,
-                             int i0, int i1, float * yl) {
+// 4-subspace block: one yl tile load/store applies 4 LUTs (x86 ds4_block).
+// Tile=64 keeps yl in regs; each LUT is loaded once per tile (4x reuse).
+static void pq_s1_phase1_ds4_block(const PQTensor & t, const pq_f16 * xh,
+                                   int i0, int i1, pq_f16 * yl) {
     const int dout = (int) t.n_out;
     const pq_f16 * cbh = t.cbh.data();
     const uint8_t * idx = t.idx.data();
     int i = i0;
     for (; i + 3 < i1; i += 4) {
-        float dt[4][GGML_PQ_K];
-        int8_t dt8[4][GGML_PQ_K];
+        if (i + 4 < i1) {
+            pq_prefetch_t0(idx + (size_t) (i + 4) * dout);
+            pq_prefetch_t0(cbh + (size_t) (i + 4) * 4 * GGML_PQ_K);
+        }
+        if (i + 8 < i1) {
+            pq_prefetch_t1(idx + (size_t) (i + 8) * dout);
+            pq_prefetch_t1(cbh + (size_t) (i + 8) * 4 * GGML_PQ_K);
+        }
+
+        alignas(16) int8_t dt8[4][GGML_PQ_K];
         float inv[4];
         for (int s = 0; s < 4; s++) {
-            pq_build_dt_ds4(xh, cbh, i + s, dt[s]);
-            pq_quantize_dt(dt[s], dt8[s], &inv[s]);
+            pq_build_quant_ds4(xh, cbh, i + s, dt8[s], &inv[s]);
         }
+
+#if defined(__ARM_FEATURE_FP16_VECTOR_ARITHMETIC)
+        const float16_t hinv[4] = {
+            (float16_t) inv[0], (float16_t) inv[1],
+            (float16_t) inv[2], (float16_t) inv[3],
+        };
         int j = 0;
-        for (; j + 15 < dout; j += 16) {
-            float32x4_t y0 = vld1q_f32(yl + j + 0);
-            float32x4_t y1 = vld1q_f32(yl + j + 4);
-            float32x4_t y2 = vld1q_f32(yl + j + 8);
-            float32x4_t y3 = vld1q_f32(yl + j + 12);
-            for (int s = 0; s < 4; s++) {
-                const uint8x16_t iv = vld1q_u8(idx + (size_t) (i + s) * dout + j);
-                const int8x16_t qv = pq_neon_tbl256_s8(dt8[s], iv);
-                const int16x8_t qlo = vmovl_s8(vget_low_s8(qv));
-                const int16x8_t qhi = vmovl_high_s8(qv);
-                float32x4_t f0 = vcvtq_f32_s32(vmovl_s16(vget_low_s16(qlo)));
-                float32x4_t f1 = vcvtq_f32_s32(vmovl_high_s16(qlo));
-                float32x4_t f2 = vcvtq_f32_s32(vmovl_s16(vget_low_s16(qhi)));
-                float32x4_t f3 = vcvtq_f32_s32(vmovl_high_s16(qhi));
-                y0 = vfmaq_n_f32(y0, f0, inv[s]);
-                y1 = vfmaq_n_f32(y1, f1, inv[s]);
-                y2 = vfmaq_n_f32(y2, f2, inv[s]);
-                y3 = vfmaq_n_f32(y3, f3, inv[s]);
+        for (; j + 63 < dout; j += 64) {
+            if (j + 256 < dout) {
+                pq_prefetch_t0(idx + (size_t) i * dout + j + 256);
             }
-            vst1q_f32(yl + j + 0, y0);
-            vst1q_f32(yl + j + 4, y1);
-            vst1q_f32(yl + j + 8, y2);
-            vst1q_f32(yl + j + 12, y3);
+            float16x8_t y0 = vld1q_f16((const __fp16 *) (yl + j + 0));
+            float16x8_t y1 = vld1q_f16((const __fp16 *) (yl + j + 8));
+            float16x8_t y2 = vld1q_f16((const __fp16 *) (yl + j + 16));
+            float16x8_t y3 = vld1q_f16((const __fp16 *) (yl + j + 24));
+            float16x8_t y4 = vld1q_f16((const __fp16 *) (yl + j + 32));
+            float16x8_t y5 = vld1q_f16((const __fp16 *) (yl + j + 40));
+            float16x8_t y6 = vld1q_f16((const __fp16 *) (yl + j + 48));
+            float16x8_t y7 = vld1q_f16((const __fp16 *) (yl + j + 56));
+            for (int s = 0; s < 4; s++) {
+                const PqLut256 L = pq_lut256_load(dt8[s]);
+                const uint8_t * ii = idx + (size_t) (i + s) * dout + j;
+                const float16_t iv = hinv[s];
+                pq_fma_lut16_f16(y0, y1, L, ii + 0, iv);
+                pq_fma_lut16_f16(y2, y3, L, ii + 16, iv);
+                pq_fma_lut16_f16(y4, y5, L, ii + 32, iv);
+                pq_fma_lut16_f16(y6, y7, L, ii + 48, iv);
+            }
+            vst1q_f16((__fp16 *) (yl + j + 0), y0);
+            vst1q_f16((__fp16 *) (yl + j + 8), y1);
+            vst1q_f16((__fp16 *) (yl + j + 16), y2);
+            vst1q_f16((__fp16 *) (yl + j + 24), y3);
+            vst1q_f16((__fp16 *) (yl + j + 32), y4);
+            vst1q_f16((__fp16 *) (yl + j + 40), y5);
+            vst1q_f16((__fp16 *) (yl + j + 48), y6);
+            vst1q_f16((__fp16 *) (yl + j + 56), y7);
         }
+        for (; j + 15 < dout; j += 16) {
+            float16x8_t y0 = vld1q_f16((const __fp16 *) (yl + j));
+            float16x8_t y1 = vld1q_f16((const __fp16 *) (yl + j + 8));
+            for (int s = 0; s < 4; s++) {
+                const PqLut256 L = pq_lut256_load(dt8[s]);
+                pq_fma_lut16_f16(y0, y1, L,
+                                 idx + (size_t) (i + s) * dout + j, hinv[s]);
+            }
+            vst1q_f16((__fp16 *) (yl + j), y0);
+            vst1q_f16((__fp16 *) (yl + j + 8), y1);
+        }
+#else
+        int j = 0;
+        for (; j + 31 < dout; j += 32) {
+            float tmp[32];
+            for (int t = 0; t < 32; t++) {
+                tmp[t] = pq_to_f32(yl[j + t]);
+            }
+            float32x4_t a0 = vld1q_f32(tmp + 0),  a1 = vld1q_f32(tmp + 4);
+            float32x4_t a2 = vld1q_f32(tmp + 8),  a3 = vld1q_f32(tmp + 12);
+            float32x4_t b0 = vld1q_f32(tmp + 16), b1 = vld1q_f32(tmp + 20);
+            float32x4_t b2 = vld1q_f32(tmp + 24), b3 = vld1q_f32(tmp + 28);
+            for (int s = 0; s < 4; s++) {
+                const PqLut256 L = pq_lut256_load(dt8[s]);
+                const uint8_t * ii = idx + (size_t) (i + s) * dout + j;
+                pq_fma_lut16_f32(a0, a1, a2, a3, L, ii, inv[s]);
+                pq_fma_lut16_f32(b0, b1, b2, b3, L, ii + 16, inv[s]);
+            }
+            vst1q_f32(tmp + 0, a0);  vst1q_f32(tmp + 4, a1);
+            vst1q_f32(tmp + 8, a2);  vst1q_f32(tmp + 12, a3);
+            vst1q_f32(tmp + 16, b0); vst1q_f32(tmp + 20, b1);
+            vst1q_f32(tmp + 24, b2); vst1q_f32(tmp + 28, b3);
+            for (int t = 0; t < 32; t++) {
+                yl[j + t] = pq_from_f32(tmp[t]);
+            }
+        }
+        for (; j + 15 < dout; j += 16) {
+            float tmp[16];
+            for (int t = 0; t < 16; t++) {
+                tmp[t] = pq_to_f32(yl[j + t]);
+            }
+            float32x4_t y0 = vld1q_f32(tmp + 0), y1 = vld1q_f32(tmp + 4);
+            float32x4_t y2 = vld1q_f32(tmp + 8), y3 = vld1q_f32(tmp + 12);
+            for (int s = 0; s < 4; s++) {
+                const PqLut256 L = pq_lut256_load(dt8[s]);
+                pq_fma_lut16_f32(y0, y1, y2, y3, L,
+                                 idx + (size_t) (i + s) * dout + j, inv[s]);
+            }
+            vst1q_f32(tmp + 0, y0); vst1q_f32(tmp + 4, y1);
+            vst1q_f32(tmp + 8, y2); vst1q_f32(tmp + 12, y3);
+            for (int t = 0; t < 16; t++) {
+                yl[j + t] = pq_from_f32(tmp[t]);
+            }
+        }
+#endif
         for (; j < dout; j++) {
-            float v = yl[j];
+            float v = pq_to_f32(yl[j]);
             for (int s = 0; s < 4; s++) {
                 v += (float) dt8[s][idx[(size_t) (i + s) * dout + j]] * inv[s];
             }
-            yl[j] = v;
+            yl[j] = pq_from_f32(v);
         }
     }
     for (; i < i1; i++) {
@@ -335,8 +484,20 @@ static void pq_s1_phase1_ds4(const PQTensor & t, const pq_f16 * xh,
     }
 }
 
+static void pq_s1_phase1_ds4(const PQTensor & t, const pq_f16 * xh,
+                             int i0, int i1, pq_f16 * yl) {
+    static const bool g_generic = getenv("GGML_PQ_DS4_GENERIC") != nullptr;
+    if (g_generic) {
+        for (int i = i0; i < i1; i++) {
+            pq_s1_accumulate_subspace(t, xh, i, yl);
+        }
+        return;
+    }
+    pq_s1_phase1_ds4_block(t, xh, i0, i1, yl);
+}
+
 static void pq_s1_phase1(const PQTensor & t, const pq_f16 * xh,
-                         int i0, int i1, float * yl) {
+                         int i0, int i1, pq_f16 * yl) {
     if (t.ds == 4) {
         pq_s1_phase1_ds4(t, xh, i0, i1, yl);
         return;
@@ -347,27 +508,70 @@ static void pq_s1_phase1(const PQTensor & t, const pq_f16 * xh,
 }
 
 static void pq_s1_phase2(const PQTensor & t, float * dst, int j0, int j1,
-                         int nth, const float * base) {
+                         int nth, const pq_f16 * base) {
     const size_t row = (size_t) t.n_out;
     int j = j0;
-    for (; j + 3 < j1; j += 4) {
-        float32x4_t sum = vdupq_n_f32(0.f);
+#if defined(__ARM_FEATURE_FP16_VECTOR_ARITHMETIC)
+    for (; j + 15 < j1; j += 16) {
+        float32x4_t s0 = vdupq_n_f32(0.f);
+        float32x4_t s1 = vdupq_n_f32(0.f);
+        float32x4_t s2 = vdupq_n_f32(0.f);
+        float32x4_t s3 = vdupq_n_f32(0.f);
         for (int p = 0; p < nth; p++) {
-            sum = vaddq_f32(sum, vld1q_f32(base + (size_t) p * row + j));
+            const pq_f16 * src = base + (size_t) p * row + j;
+            const float16x8_t h0 = vld1q_f16((const __fp16 *) src);
+            const float16x8_t h1 = vld1q_f16((const __fp16 *) (src + 8));
+            s0 = vaddq_f32(s0, vcvt_f32_f16(vget_low_f16(h0)));
+            s1 = vaddq_f32(s1, vcvt_f32_f16(vget_high_f16(h0)));
+            s2 = vaddq_f32(s2, vcvt_f32_f16(vget_low_f16(h1)));
+            s3 = vaddq_f32(s3, vcvt_f32_f16(vget_high_f16(h1)));
         }
         if (t.scaled) {
-            sum = vmulq_f32(sum, vld1q_f32(t.row_scale.data() + j));
+            s0 = vmulq_f32(s0, vld1q_f32(t.row_scale.data() + j + 0));
+            s1 = vmulq_f32(s1, vld1q_f32(t.row_scale.data() + j + 4));
+            s2 = vmulq_f32(s2, vld1q_f32(t.row_scale.data() + j + 8));
+            s3 = vmulq_f32(s3, vld1q_f32(t.row_scale.data() + j + 12));
         }
-        vst1q_f32(dst + j, sum);
+        vst1q_f32(dst + j + 0, s0);
+        vst1q_f32(dst + j + 4, s1);
+        vst1q_f32(dst + j + 8, s2);
+        vst1q_f32(dst + j + 12, s3);
+    }
+#endif
+    for (; j + 7 < j1; j += 8) {
+        float32x4_t sum0 = vdupq_n_f32(0.f);
+        float32x4_t sum1 = vdupq_n_f32(0.f);
+        for (int p = 0; p < nth; p++) {
+            const pq_f16 * src = base + (size_t) p * row + j;
+#if defined(__ARM_FEATURE_FP16_VECTOR_ARITHMETIC)
+            const float16x8_t h = vld1q_f16((const __fp16 *) src);
+            sum0 = vaddq_f32(sum0, vcvt_f32_f16(vget_low_f16(h)));
+            sum1 = vaddq_f32(sum1, vcvt_f32_f16(vget_high_f16(h)));
+#else
+            float tmp[8] = {
+                pq_to_f32(src[0]), pq_to_f32(src[1]), pq_to_f32(src[2]), pq_to_f32(src[3]),
+                pq_to_f32(src[4]), pq_to_f32(src[5]), pq_to_f32(src[6]), pq_to_f32(src[7]),
+            };
+            sum0 = vaddq_f32(sum0, vld1q_f32(tmp));
+            sum1 = vaddq_f32(sum1, vld1q_f32(tmp + 4));
+#endif
+        }
+        if (t.scaled) {
+            sum0 = vmulq_f32(sum0, vld1q_f32(t.row_scale.data() + j));
+            sum1 = vmulq_f32(sum1, vld1q_f32(t.row_scale.data() + j + 4));
+        }
+        vst1q_f32(dst + j, sum0);
+        vst1q_f32(dst + j + 4, sum1);
     }
     for (; j < j1; j++) {
         float sum = 0.f;
         for (int p = 0; p < nth; p++) {
-            sum += base[(size_t) p * row + j];
+            sum += pq_to_f32(base[(size_t) p * row + j]);
         }
         dst[j] = t.scaled ? sum * t.row_scale[(size_t) j] : sum;
     }
 }
+
 
 struct S2XBufs { const pq_f16 * xh; const int8_t * xq; float xs; int64_t sx; };
 
@@ -413,21 +617,36 @@ static void pq_s2_gemv_ds2_neon(const PQTensor & t, const S2XBufs & xb,
     const pq_f16 * xh = xb.xh;
     const int8_t * xq = xb.xq;
     const float xs = xb.xs;
-    (void) xb.sx; // x86 unsigned-LUT path needs sx for +128 correction; signed NEON does not
+    (void) xb.sx;
 
     for (int i = i0; i < i1; i++) {
+        if (i + 1 < i1) {
+            pq_prefetch_t0(idx + (size_t) (i + 1) * din);
+            pq_prefetch_t0(cb8 + (size_t) (i + 1) * 512);
+        }
+        if (i + 8 < i1) {
+            pq_prefetch_t1(idx + (size_t) (i + 8) * din);
+            pq_prefetch_t1(cb8 + (size_t) (i + 8) * 512);
+        }
+
         const int8_t * ce = cb8 + (size_t) i * 512;
         const int8_t * co = ce + 256;
         const uint8_t * ii = idx + (size_t) i * din;
+        const PqLut256 Le = pq_lut256_load(ce);
+        const PqLut256 Lo = pq_lut256_load(co);
 
         int32x4_t ae = vdupq_n_s32(0);
         int32x4_t ao = vdupq_n_s32(0);
         int j = 0;
         for (; j + 15 < din; j += 16) {
+            if (j + 128 < din) {
+                pq_prefetch_t0(ii + j + 128);
+                pq_prefetch_t0(xq + j + 128);
+            }
             const int8x16_t xv = vld1q_s8(xq + j);
             const uint8x16_t iv = vld1q_u8(ii + j);
-            const int8x16_t qe = pq_neon_tbl256_s8(ce, iv);
-            const int8x16_t qo = pq_neon_tbl256_s8(co, iv);
+            const int8x16_t qe = pq_lut256_lookup(Le, iv);
+            const int8x16_t qo = pq_lut256_lookup(Lo, iv);
             ae = pq_neon_sdot(ae, qe, xv);
             ao = pq_neon_sdot(ao, qo, xv);
         }
@@ -550,8 +769,8 @@ static void pq_s1_flush(S1Group & g, int ith, int nth, void * threadpool, bool s
         const int M = (int) (tm.n_in / tm.ds);
         const int a0 = (int) ((int64_t) M * ith / nth);
         const int a1 = (int) ((int64_t) M * (ith + 1) / nth);
-        float * my = g_s1_partials.data() + base[m] + (size_t) ith * tm.n_out;
-        std::fill(my, my + tm.n_out, 0.f);
+        pq_f16 * my = g_s1_partials.data() + base[m] + (size_t) ith * tm.n_out;
+        memset(my, 0, (size_t) tm.n_out * sizeof(pq_f16));
         if (a1 > a0) {
             pq_s1_phase1(tm, g.xh[m], a0, a1, my);
         }
@@ -661,7 +880,7 @@ bool ggml_pq_register(const char * name, int mode, int ds,
         std::lock_guard<std::mutex> lk(g_s1_mu);
         const size_t want = 4 * kMaxThreads * (size_t) n_out;
         if (g_s1_partials.size() < want) {
-            g_s1_partials.assign(want, 0.f);
+            g_s1_partials.assign(want, pq_from_f32(0.f));
         }
     }
     return true;
@@ -699,7 +918,7 @@ bool ggml_pq_register_raw(const char * name, int mode, int ds, const void * cb,
         std::lock_guard<std::mutex> lk(g_s1_mu);
         const size_t want = 4 * kMaxThreads * (size_t) n_out;
         if (g_s1_partials.size() < want) {
-            g_s1_partials.assign(want, 0.f);
+            g_s1_partials.assign(want, pq_from_f32(0.f));
         }
     }
     return true;
@@ -726,7 +945,7 @@ bool ggml_pq_register_raw_scaled(const char * name, int ds, const void * cb,
     std::lock_guard<std::mutex> lk(g_s1_mu);
     const size_t want = 4 * kMaxThreads * (size_t) n_out;
     if (g_s1_partials.size() < want) {
-        g_s1_partials.assign(want, 0.f);
+        g_s1_partials.assign(want, pq_from_f32(0.f));
     }
     return true;
 }

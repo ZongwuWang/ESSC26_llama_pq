@@ -106,7 +106,7 @@ std::atomic<bool> g_pq_enabled{false};
 
 constexpr int kMaxThreads = 1024; // Kunpeng nodes can expose 640+ logical CPUs
 constexpr int kMaxNumaNodes = 8;
-constexpr int kS1OutTile = 256; // amortize LUT load across a large output tile
+constexpr int kS1OutTile = 128; // amortize LUT load; 256 hurt L1 with large M
 
 // Legacy fp16 partials path (GGML_PQ_S1_PARTIALS=1): halves phase2 traffic vs float32.
 std::vector<pq_f16> g_s1_partials;
@@ -732,8 +732,8 @@ static void pq_s1_publish_luts(const PQTensor & t, const pq_f16 * xh,
 }
 
 // Output-owned accumulate over shared LUTs.
-// Phase1-equivalent: int32 accumulate per subspace, then scale by inv once
-// (avoids s8→fp per-FMA). Supports K=256 (4×tbl) and K=64 (1×tbl).
+// Keep float FMA (inv applied in-loop): the int32 scratch+zero path was a
+// regression on K=256 (~18→7 tok/s). K=64 uses a single vqtbl4q.
 static void pq_s1_phase2_shared(const PQTensor & t, float * dst, int j0, int j1,
                                 const int8_t * dt8, const float * inv) {
     const int M = (int) (t.n_in / t.ds);
@@ -743,9 +743,9 @@ static void pq_s1_phase2_shared(const PQTensor & t, float * dst, int j0, int j1,
 
     for (int jbase = j0; jbase < j1; ) {
         const int jb = std::min(kS1OutTile, j1 - jbase);
-        alignas(16) float facc[kS1OutTile];
+        alignas(16) float acc[kS1OutTile];
         for (int z = 0; z < jb; z++) {
-            facc[z] = 0.f;
+            acc[z] = 0.f;
         }
 
         for (int i = 0; i < M; i++) {
@@ -757,72 +757,51 @@ static void pq_s1_phase2_shared(const PQTensor & t, float * dst, int j0, int j1,
             const uint8_t * ii = idx + (size_t) i * dout + jbase;
             const int8_t * row = dt8 + (size_t) i * K;
 
-            alignas(16) int32_t iacc[kS1OutTile];
-            for (int z = 0; z < jb; z++) {
-                iacc[z] = 0;
-            }
-
             if (K == 64) {
                 const PqLut64 L = pq_lut64_load(row);
                 int off = 0;
                 for (; off + 15 < jb; off += 16) {
+                    float32x4_t a0 = vld1q_f32(acc + off + 0);
+                    float32x4_t a1 = vld1q_f32(acc + off + 4);
+                    float32x4_t a2 = vld1q_f32(acc + off + 8);
+                    float32x4_t a3 = vld1q_f32(acc + off + 12);
                     const int8x16_t qv = pq_lut64_lookup(L, vld1q_u8(ii + off));
                     const int16x8_t qlo = vmovl_s8(vget_low_s8(qv));
                     const int16x8_t qhi = vmovl_high_s8(qv);
-                    int32x4_t a0 = vld1q_s32(iacc + off + 0);
-                    int32x4_t a1 = vld1q_s32(iacc + off + 4);
-                    int32x4_t a2 = vld1q_s32(iacc + off + 8);
-                    int32x4_t a3 = vld1q_s32(iacc + off + 12);
-                    a0 = vaddq_s32(a0, vmovl_s16(vget_low_s16(qlo)));
-                    a1 = vaddq_s32(a1, vmovl_high_s16(qlo));
-                    a2 = vaddq_s32(a2, vmovl_s16(vget_low_s16(qhi)));
-                    a3 = vaddq_s32(a3, vmovl_high_s16(qhi));
-                    vst1q_s32(iacc + off + 0, a0);
-                    vst1q_s32(iacc + off + 4, a1);
-                    vst1q_s32(iacc + off + 8, a2);
-                    vst1q_s32(iacc + off + 12, a3);
+                    a0 = vfmaq_n_f32(a0, vcvtq_f32_s32(vmovl_s16(vget_low_s16(qlo))), iv);
+                    a1 = vfmaq_n_f32(a1, vcvtq_f32_s32(vmovl_high_s16(qlo)), iv);
+                    a2 = vfmaq_n_f32(a2, vcvtq_f32_s32(vmovl_s16(vget_low_s16(qhi))), iv);
+                    a3 = vfmaq_n_f32(a3, vcvtq_f32_s32(vmovl_high_s16(qhi)), iv);
+                    vst1q_f32(acc + off + 0, a0);
+                    vst1q_f32(acc + off + 4, a1);
+                    vst1q_f32(acc + off + 8, a2);
+                    vst1q_f32(acc + off + 12, a3);
                 }
                 for (; off < jb; off++) {
-                    iacc[off] += (int32_t) row[ii[off]];
+                    acc[off] += (float) row[ii[off]] * iv;
                 }
             } else {
                 const PqLut256 L = pq_lut256_load(row);
                 int off = 0;
                 for (; off + 15 < jb; off += 16) {
-                    const int8x16_t qv = pq_lut256_lookup(L, vld1q_u8(ii + off));
-                    const int16x8_t qlo = vmovl_s8(vget_low_s8(qv));
-                    const int16x8_t qhi = vmovl_high_s8(qv);
-                    int32x4_t a0 = vld1q_s32(iacc + off + 0);
-                    int32x4_t a1 = vld1q_s32(iacc + off + 4);
-                    int32x4_t a2 = vld1q_s32(iacc + off + 8);
-                    int32x4_t a3 = vld1q_s32(iacc + off + 12);
-                    a0 = vaddq_s32(a0, vmovl_s16(vget_low_s16(qlo)));
-                    a1 = vaddq_s32(a1, vmovl_high_s16(qlo));
-                    a2 = vaddq_s32(a2, vmovl_s16(vget_low_s16(qhi)));
-                    a3 = vaddq_s32(a3, vmovl_high_s16(qhi));
-                    vst1q_s32(iacc + off + 0, a0);
-                    vst1q_s32(iacc + off + 4, a1);
-                    vst1q_s32(iacc + off + 8, a2);
-                    vst1q_s32(iacc + off + 12, a3);
+                    float32x4_t a0 = vld1q_f32(acc + off + 0);
+                    float32x4_t a1 = vld1q_f32(acc + off + 4);
+                    float32x4_t a2 = vld1q_f32(acc + off + 8);
+                    float32x4_t a3 = vld1q_f32(acc + off + 12);
+                    pq_fma_lut16_f32(a0, a1, a2, a3, L, ii + off, iv);
+                    vst1q_f32(acc + off + 0, a0);
+                    vst1q_f32(acc + off + 4, a1);
+                    vst1q_f32(acc + off + 8, a2);
+                    vst1q_f32(acc + off + 12, a3);
                 }
                 for (; off < jb; off++) {
-                    iacc[off] += (int32_t) row[ii[off]];
+                    acc[off] += (float) row[ii[off]] * iv;
                 }
-            }
-
-            int off = 0;
-            for (; off + 3 < jb; off += 4) {
-                float32x4_t f = vld1q_f32(facc + off);
-                f = vfmaq_n_f32(f, vcvtq_f32_s32(vld1q_s32(iacc + off)), iv);
-                vst1q_f32(facc + off, f);
-            }
-            for (; off < jb; off++) {
-                facc[off] += (float) iacc[off] * iv;
             }
         }
 
         for (int u = 0; u < jb; u++) {
-            float v = facc[u];
+            float v = acc[u];
             if (t.scaled) {
                 v *= t.row_scale[(size_t) (jbase + u)];
             }

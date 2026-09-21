@@ -219,6 +219,34 @@ bool llama_pq_build_pack(struct ggml_tensor * t, int mode, int ds,
     return true;
 }
 
+bool llama_pq_build_scaled_s1_side(struct ggml_tensor * t, int ds, int K,
+                                   std::vector<ggml_fp16_t> & cbh,
+                                   std::vector<uint8_t> & idx,
+                                   std::vector<float> & row_scale) {
+    llama_pq_pack pack;
+    if (!llama_pq_build_pack(t, 0, ds, pack, K)) {
+        return false;
+    }
+    if (pack.mode != 0 || pack.ds != ds || pack.K != K) {
+        return false;
+    }
+    const int64_t n_in  = pack.n_in;
+    const int64_t n_out = pack.n_out;
+    const int M = (int) (n_in / ds);
+    cbh.resize((size_t) n_in * K);
+    for (int i = 0; i < M; i++) {
+        for (int k = 0; k < K; k++) {
+            for (int d = 0; d < ds; d++) {
+                const float v = pack.cbf[((size_t) i * K + k) * ds + d];
+                cbh[((size_t) (i * ds + d)) * K + k] = ggml_fp32_to_fp16(v);
+            }
+        }
+    }
+    idx = pack.idx;
+    row_scale.assign((size_t) n_out, 1.f);
+    return true;
+}
+
 bool llama_pq_register_tensor(struct ggml_tensor * t, int mode, int ds, int K) {
     llama_pq_pack pack;
     if (!llama_pq_build_pack(t, mode, ds, pack, K)) return false;

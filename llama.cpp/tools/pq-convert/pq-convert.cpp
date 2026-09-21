@@ -90,7 +90,7 @@ int main(int argc, char ** argv) {
     if (argc < 3) {
         fprintf(stderr, "usage: %s <input.gguf> <output.gguf> [--pq-ds N] [--pq-mode auto|s1|s2]"
                         " [--pq-k 256|64] [--pq-target auto|kunpeng]"
-                        " [--train-from <f16.gguf>] [--pq4c8b-dir <dir>]\n", argv[0]);
+                        " [--pq-scaled] [--train-from <f16.gguf>] [--pq4c8b-dir <dir>]\n", argv[0]);
         return 1;
     }
     const char * in_path  = argv[1];
@@ -101,6 +101,7 @@ int main(int argc, char ** argv) {
     int pq_k = GGML_PQ_K;
     int mode_cfg = 0; // 0=auto, 1=s1, 2=s2
     int target = 0;   // 0=auto (x86 heuristic), 1=kunpeng (prefer S2)
+    int pq_scaled = 0; // S1 ds=4 -> GGUF mode 4 (scaled fp16 cb), for K=64 Kunpeng
     for (int i = 3; i < argc; i++) {
         if (!strcmp(argv[i], "--train-from") && i + 1 < argc) tr_path = argv[++i];
         else if (!strcmp(argv[i], "--pq4c8b-dir") && i + 1 < argc) pq4_dir = argv[++i];
@@ -120,6 +121,8 @@ int main(int argc, char ** argv) {
         } else if (!strcmp(argv[i], "--pq-target") && i + 1 < argc) {
             const char * t = argv[++i];
             target = !strcmp(t, "kunpeng") ? 1 : 0;
+        } else if (!strcmp(argv[i], "--pq-scaled")) {
+            pq_scaled = 1;
         } else {
             fprintf(stderr, "unknown arg: %s\n", argv[i]);
             return 1;
@@ -248,6 +251,44 @@ int main(int argc, char ** argv) {
                 }
             }
         }
+        if (pq_scaled && mode == 0 && ds == 4) {
+            std::vector<ggml_fp16_t> cbh;
+            std::vector<uint8_t> idx;
+            std::vector<float> row_scale;
+            if (!llama_pq_build_scaled_s1_side(t_tr, ds, pq_k, cbh, idx, row_scale)) {
+                continue;
+            }
+            const int M = (int) (t->ne[0] / ds);
+            const int32_t meta[4] = { 4, 4, pq_k, M };
+            storages.emplace_back(sizeof(meta));
+            memcpy(storages.back().data(), meta, sizeof(meta));
+            llama_pq_side_name(nm, sizeof(nm), name, "pq_meta");
+            const int64_t ne_meta[1] = { 4 };
+            gguf_add_tensor(ctx_out, make_tensor(ctx_side, nm, GGML_TYPE_I32, 1, ne_meta,
+                                                 storages.back().data()));
+            auto add_raw = [&](const char * suffix, ggml_type type, int ndim,
+                               const int64_t * ne, const void * src, size_t bytes) {
+                storages.emplace_back(bytes);
+                memcpy(storages.back().data(), src, bytes);
+                llama_pq_side_name(nm, sizeof(nm), name, suffix);
+                struct ggml_tensor * st = ggml_new_tensor(ctx_side, type, ndim, ne);
+                ggml_set_name(st, nm);
+                st->data = storages.back().data();
+                gguf_add_tensor(ctx_out, st);
+            };
+            const int64_t ne_cb[2] = { pq_k, t->ne[0] };
+            const int64_t ne_idx[2] = { t->ne[1], M };
+            const int64_t ne_sc[1] = { t->ne[1] };
+            add_raw("pq_cb", GGML_TYPE_F16, 2, ne_cb, cbh.data(),
+                    cbh.size() * sizeof(ggml_fp16_t));
+            add_raw("pq_idx", GGML_TYPE_I8, 2, ne_idx, idx.data(), idx.size());
+            add_raw("pq_row_scale", GGML_TYPE_F32, 1, ne_sc, row_scale.data(),
+                    row_scale.size() * sizeof(float));
+            n_pq++;
+            fprintf(stderr, "%s: PQ scaled S1 K=%d ds=4 '%s'\n", __func__, pq_k, name);
+            continue;
+        }
+
         llama_pq_pack pack;
         if (!llama_pq_build_pack(t_tr, mode, ds, pack, pq_k)) continue;
 

@@ -298,7 +298,31 @@ static inline void pq_fma_lut16_f16(float16x8_t & y0, float16x8_t & y1,
     y0 = vfmaq_n_f16(y0, lo, inv);
     y1 = vfmaq_n_f16(y1, hi, inv);
 }
+
+static inline void pq_fma_lut16_f16(float16x8_t & y0, float16x8_t & y1,
+                                    const PqLut64 & L, const uint8_t * ii,
+                                    float16_t inv) {
+    const int8x16_t qv = pq_lut64_lookup(L, vld1q_u8(ii));
+    float16x8_t lo, hi;
+    pq_i8_to_f16x8x2(qv, lo, hi);
+    y0 = vfmaq_n_f16(y0, lo, inv);
+    y1 = vfmaq_n_f16(y1, hi, inv);
+}
 #endif
+
+__attribute__((always_inline))
+static inline void pq_fma_lut16_f32(float32x4_t & y0, float32x4_t & y1,
+                                    float32x4_t & y2, float32x4_t & y3,
+                                    const PqLut64 & L, const uint8_t * ii,
+                                    float inv) {
+    const int8x16_t qv = pq_lut64_lookup(L, vld1q_u8(ii));
+    const int16x8_t qlo = vmovl_s8(vget_low_s8(qv));
+    const int16x8_t qhi = vmovl_high_s8(qv);
+    y0 = vfmaq_n_f32(y0, vcvtq_f32_s32(vmovl_s16(vget_low_s16(qlo))), inv);
+    y1 = vfmaq_n_f32(y1, vcvtq_f32_s32(vmovl_high_s16(qlo)), inv);
+    y2 = vfmaq_n_f32(y2, vcvtq_f32_s32(vmovl_s16(vget_low_s16(qhi))), inv);
+    y3 = vfmaq_n_f32(y3, vcvtq_f32_s32(vmovl_high_s16(qhi)), inv);
+}
 
 __attribute__((always_inline))
 static inline void pq_fma_lut16_f32(float32x4_t & y0, float32x4_t & y1,
@@ -493,11 +517,133 @@ static void pq_s1_accumulate_subspace(const PQTensor & t, const pq_f16 * xh,
     }
 }
 
+// K=64 ds=4 block: same structure as K=256 but one vqtbl4q per LUT (Kunpeng).
+static void pq_s1_phase1_ds4_block_k64(const PQTensor & t, const pq_f16 * xh,
+                                       int i0, int i1, pq_f16 * yl) {
+    const int K = GGML_PQ_K_ARM;
+    const int dout = (int) t.n_out;
+    const pq_f16 * cbh = t.cbh.data();
+    const uint8_t * idx = t.idx.data();
+    int i = i0;
+    for (; i + 3 < i1; i += 4) {
+        if (i + 4 < i1) {
+            pq_prefetch_t0(idx + (size_t) (i + 4) * dout);
+            pq_prefetch_t0(cbh + (size_t) (i + 4) * 4 * K);
+        }
+        alignas(16) int8_t dt8[4][GGML_PQ_K_ARM];
+        float inv[4];
+        for (int s = 0; s < 4; s++) {
+            pq_build_quant_ds4(xh, cbh, i + s, K, dt8[s], &inv[s]);
+        }
+#if defined(__ARM_FEATURE_FP16_VECTOR_ARITHMETIC)
+        const float16_t hinv[4] = {
+            (float16_t) inv[0], (float16_t) inv[1],
+            (float16_t) inv[2], (float16_t) inv[3],
+        };
+        int j = 0;
+        for (; j + 63 < dout; j += 64) {
+            float16x8_t y0 = vld1q_f16((const __fp16 *) (yl + j + 0));
+            float16x8_t y1 = vld1q_f16((const __fp16 *) (yl + j + 8));
+            float16x8_t y2 = vld1q_f16((const __fp16 *) (yl + j + 16));
+            float16x8_t y3 = vld1q_f16((const __fp16 *) (yl + j + 24));
+            float16x8_t y4 = vld1q_f16((const __fp16 *) (yl + j + 32));
+            float16x8_t y5 = vld1q_f16((const __fp16 *) (yl + j + 40));
+            float16x8_t y6 = vld1q_f16((const __fp16 *) (yl + j + 48));
+            float16x8_t y7 = vld1q_f16((const __fp16 *) (yl + j + 56));
+            for (int s = 0; s < 4; s++) {
+                const PqLut64 L = pq_lut64_load(dt8[s]);
+                const uint8_t * ii = idx + (size_t) (i + s) * dout + j;
+                pq_fma_lut16_f16(y0, y1, L, ii + 0, hinv[s]);
+                pq_fma_lut16_f16(y2, y3, L, ii + 16, hinv[s]);
+                pq_fma_lut16_f16(y4, y5, L, ii + 32, hinv[s]);
+                pq_fma_lut16_f16(y6, y7, L, ii + 48, hinv[s]);
+            }
+            vst1q_f16((__fp16 *) (yl + j + 0), y0);
+            vst1q_f16((__fp16 *) (yl + j + 8), y1);
+            vst1q_f16((__fp16 *) (yl + j + 16), y2);
+            vst1q_f16((__fp16 *) (yl + j + 24), y3);
+            vst1q_f16((__fp16 *) (yl + j + 32), y4);
+            vst1q_f16((__fp16 *) (yl + j + 40), y5);
+            vst1q_f16((__fp16 *) (yl + j + 48), y6);
+            vst1q_f16((__fp16 *) (yl + j + 56), y7);
+        }
+        for (; j + 15 < dout; j += 16) {
+            float16x8_t y0 = vld1q_f16((const __fp16 *) (yl + j));
+            float16x8_t y1 = vld1q_f16((const __fp16 *) (yl + j + 8));
+            for (int s = 0; s < 4; s++) {
+                const PqLut64 L = pq_lut64_load(dt8[s]);
+                pq_fma_lut16_f16(y0, y1, L,
+                                 idx + (size_t) (i + s) * dout + j, hinv[s]);
+            }
+            vst1q_f16((__fp16 *) (yl + j), y0);
+            vst1q_f16((__fp16 *) (yl + j + 8), y1);
+        }
+#else
+        int j = 0;
+        for (; j + 31 < dout; j += 32) {
+            float tmp[32];
+            for (int t_ = 0; t_ < 32; t_++) {
+                tmp[t_] = pq_to_f32(yl[j + t_]);
+            }
+            float32x4_t a0 = vld1q_f32(tmp + 0),  a1 = vld1q_f32(tmp + 4);
+            float32x4_t a2 = vld1q_f32(tmp + 8),  a3 = vld1q_f32(tmp + 12);
+            float32x4_t b0 = vld1q_f32(tmp + 16), b1 = vld1q_f32(tmp + 20);
+            float32x4_t b2 = vld1q_f32(tmp + 24), b3 = vld1q_f32(tmp + 28);
+            for (int s = 0; s < 4; s++) {
+                const PqLut64 L = pq_lut64_load(dt8[s]);
+                const uint8_t * ii = idx + (size_t) (i + s) * dout + j;
+                pq_fma_lut16_f32(a0, a1, a2, a3, L, ii, inv[s]);
+                pq_fma_lut16_f32(b0, b1, b2, b3, L, ii + 16, inv[s]);
+            }
+            vst1q_f32(tmp + 0, a0);  vst1q_f32(tmp + 4, a1);
+            vst1q_f32(tmp + 8, a2);  vst1q_f32(tmp + 12, a3);
+            vst1q_f32(tmp + 16, b0); vst1q_f32(tmp + 20, b1);
+            vst1q_f32(tmp + 24, b2); vst1q_f32(tmp + 28, b3);
+            for (int t_ = 0; t_ < 32; t_++) {
+                yl[j + t_] = pq_from_f32(tmp[t_]);
+            }
+        }
+        for (; j + 15 < dout; j += 16) {
+            float tmp[16];
+            for (int t_ = 0; t_ < 16; t_++) {
+                tmp[t_] = pq_to_f32(yl[j + t_]);
+            }
+            float32x4_t y0 = vld1q_f32(tmp + 0), y1 = vld1q_f32(tmp + 4);
+            float32x4_t y2 = vld1q_f32(tmp + 8), y3 = vld1q_f32(tmp + 12);
+            for (int s = 0; s < 4; s++) {
+                const PqLut64 L = pq_lut64_load(dt8[s]);
+                pq_fma_lut16_f32(y0, y1, y2, y3, L,
+                                 idx + (size_t) (i + s) * dout + j, inv[s]);
+            }
+            vst1q_f32(tmp + 0, y0); vst1q_f32(tmp + 4, y1);
+            vst1q_f32(tmp + 8, y2); vst1q_f32(tmp + 12, y3);
+            for (int t_ = 0; t_ < 16; t_++) {
+                yl[j + t_] = pq_from_f32(tmp[t_]);
+            }
+        }
+#endif
+        for (; j < dout; j++) {
+            float v = pq_to_f32(yl[j]);
+            for (int s = 0; s < 4; s++) {
+                v += (float) dt8[s][idx[(size_t) (i + s) * dout + j]] * inv[s];
+            }
+            yl[j] = pq_from_f32(v);
+        }
+    }
+    for (; i < i1; i++) {
+        pq_s1_accumulate_subspace(t, xh, i, yl);
+    }
+}
+
 // 4-subspace block: one yl tile load/store applies 4 LUTs (x86 ds4_block).
 // Tile=64 keeps yl in regs; each LUT is loaded once per tile (4x reuse).
 static void pq_s1_phase1_ds4_block(const PQTensor & t, const pq_f16 * xh,
                                    int i0, int i1, pq_f16 * yl) {
     const int K = t.K;
+    if (K == GGML_PQ_K_ARM) {
+        pq_s1_phase1_ds4_block_k64(t, xh, i0, i1, yl);
+        return;
+    }
     if (K != GGML_PQ_K) {
         for (int i = i0; i < i1; i++) {
             pq_s1_accumulate_subspace(t, xh, i, yl);

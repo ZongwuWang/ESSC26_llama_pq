@@ -98,7 +98,8 @@ LLAMA_LDLIBS := -lllama -lggml -lggml-cpu -lggml-base -lpthread -ldl -lm
 	llama-build llama_pq prepare-chat-model chat selftest smoke benchmark ppl pq-ppl \
 	plot clean distclean kunpeng-check kunpeng-verify-isa kunpeng-build kunpeng-selftest \
 	kunpeng-smoke kunpeng-benchmark kunpeng-chat kunpeng-pq-meta kunpeng-export-s2 \
-	kunpeng-export-k64 kunpeng-export-mix kunpeng-thread-sweep
+	kunpeng-export-k64 kunpeng-export-mix kunpeng-benchmark-k64 kunpeng-pq-k64-accept \
+	kunpeng-thread-sweep
 
 help:
 	@echo "EdgePQ artifact targets:"
@@ -127,8 +128,10 @@ help:
 	@echo "  make kunpeng-chat       Interactive EdgePQ chat on all CPU cores"
 	@echo "  make kunpeng-pq-meta    Print pq_meta modes in PQ_MODEL (expect mode=4)"
 	@echo "  make kunpeng-export-s2  Online S2 K=256 A/B from F16 (not trained 4c8b)"
-	@echo "  make kunpeng-export-k64 Online S1 K=64 ds=4 (NEON single-tbl) from F16"
+	@echo "  make kunpeng-export-k64 Online scaled S1 K=64 ds=4 (mode-4 GGUF) from F16"
 	@echo "  make kunpeng-export-mix Online auto S1/S2 K=64 mix from F16"
+	@echo "  make kunpeng-benchmark-k64 Throughput with base-pq-k64-kunpeng.gguf"
+	@echo "  make kunpeng-pq-k64-accept Export K64 + PPL |Δ|<=0.2 vs $(PQ_MODEL)"
 	@echo "  make kunpeng-thread-sweep Phase0 stable thread sweep (unset S1_PARTIALS)"
 
 
@@ -469,12 +472,36 @@ kunpeng-export-s2: llama-build
 		--pq-target kunpeng --pq-mode s2 --pq-ds 2 --pq-k 256 --train-from "$(FP16_MODEL)"
 	@echo "[OK] wrote $(PQ_S2_MODEL) (online S2 K=256; PPL != EdgePQ-4c8b)"
 
-# Phase2A: ARM-friendly S1 with K=64 (single vqtbl4q), ds=4.
+# Phase2A: ARM-friendly scaled S1 K=64 (single vqtbl4q), ds=4, mode-4 side tensors.
 kunpeng-export-k64: llama-build
 	@test -f "$(FP16_MODEL)" || { echo "[ERROR] missing F16 model: $(FP16_MODEL)" >&2; exit 1; }
 	$(LLAMA_BUILD)/bin/llama-pq-convert "$(FP16_MODEL)" "$(PQ_K64_MODEL)" \
-		--pq-mode s1 --pq-ds 4 --pq-k 64 --train-from "$(FP16_MODEL)"
-	@echo "[OK] wrote $(PQ_K64_MODEL) (online S1 K=64 ds=4; measure PPL vs 4c8b)"
+		--pq-mode s1 --pq-ds 4 --pq-k 64 --pq-scaled --train-from "$(FP16_MODEL)"
+	@echo "[OK] wrote $(PQ_K64_MODEL) (scaled S1 K=64 ds=4; run kunpeng-pq-k64-accept for PPL)"
+
+kunpeng-benchmark-k64: kunpeng-check kunpeng-export-k64 llama_pq
+	mkdir -p "$(OUTPUT_DIR)"
+	env -u GGML_NODE_TIMING -u GGML_PQ_S1_SHARED \
+		GGML_PQ_STRIPE=1 GGML_PQ_NUMA_LUT="$(GGML_PQ_NUMA_LUT)" \
+		OMP_DYNAMIC=FALSE OMP_PROC_BIND=spread OMP_PLACES=cores \
+		./llama_pq --fp16 "$(FP16_MODEL)" --q2 "$(Q2_MODEL)" --pq "$(PQ_K64_MODEL)" \
+		--threads "$(AE_THREADS)" --repetitions "$(AE_REPETITIONS)" \
+		--warmup "$(AE_WARMUP)" --generations "$(AE_GENERATIONS)" \
+		--context "$(AE_CONTEXT)" --numa "$(AE_NUMA)" \
+		--output "$(OUTPUT_DIR)/throughput_k64.csv"
+
+kunpeng-pq-k64-accept: kunpeng-check kunpeng-export-k64 env check-ppl-inputs llama-build
+	mkdir -p "$(OUTPUT_DIR)"
+	@test -f "$(PQ_MODEL)" || { echo "[ERROR] missing baseline PQ: $(PQ_MODEL)" >&2; exit 1; }
+	$(PYTHON) ppl_gguf_compare.py compare \
+		--binary "$(LLAMA_BUILD)/bin/llama-perplexity" \
+		--dataset "$(PPL_DATASET)" --context "$(PQ_PPL_CONTEXT)" \
+		--stride "$(PQ_PPL_STRIDE)" --threads "$(PPL_THREADS)" \
+		--numa "$(PPL_NUMA)" --device CPU \
+		--baseline "PQ-4c8b=$(PQ_MODEL)" \
+		--candidate "PQ-K64=$(PQ_K64_MODEL)" \
+		--max-delta 0.2 \
+		--output "$(OUTPUT_DIR)/perplexity_k64_accept.csv"
 
 # Phase2B: auto mix (ffn_down->S2, rest S1) with K=64 for Kunpeng A/B.
 kunpeng-export-mix: llama-build

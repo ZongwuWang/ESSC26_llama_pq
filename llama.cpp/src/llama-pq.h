@@ -45,6 +45,13 @@ struct llama_pq_pack {
 bool llama_pq_build_pack(struct ggml_tensor * t, int mode, int ds,
                          llama_pq_pack & out, int K = GGML_PQ_K);
 
+// S1 ds=4 scaled side tensors (mode-4 GGUF): fp16 cb [n_in,K], idx, row_scale.
+// row_scale is 1.0 for online export (match decode layout of EdgePQ-4c8b).
+bool llama_pq_build_scaled_s1_side(struct ggml_tensor * t, int ds, int K,
+                                   std::vector<ggml_fp16_t> & cbh,
+                                   std::vector<uint8_t> & idx,
+                                   std::vector<float> & row_scale);
+
 // Quantize + register with the ggml-cpu PQ registry. Returns false if the
 // tensor is unsuitable.
 bool llama_pq_register_tensor(struct ggml_tensor * t, int mode, int ds,

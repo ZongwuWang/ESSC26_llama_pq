@@ -42,7 +42,10 @@ UNAME_M := $(shell uname -m)
 NPROC := $(shell nproc 2>/dev/null || echo 1)
 ifeq ($(UNAME_M),aarch64)
 GGML_CUDA ?= OFF
-AE_THREADS ?= $(NPROC)
+# llama-bench/PQ shared-LUT barriers: nproc (e.g. 640) usually hurts vs ~48–64.
+AE_THREADS ?= 60
+# Single LUT replica avoids N_nodes×memcpy on multi-NUMA Kunpeng hosts.
+GGML_PQ_NUMA_LUT ?= 0
 AE_NUMA ?= distribute
 CHAT_CPU_RANGE ?= 0-$(shell expr $(NPROC) - 1 || echo 0)
 PPL_THREADS ?= $(NPROC)
@@ -360,7 +363,9 @@ smoke: check-benchmark-inputs llama_pq
 
 benchmark: check-benchmark-inputs llama_pq
 	mkdir -p "$(OUTPUT_DIR)"
-	env -u GGML_NODE_TIMING GGML_PQ_STRIPE=1 OMP_DYNAMIC=FALSE OMP_PROC_BIND=spread OMP_PLACES=cores \
+	env -u GGML_NODE_TIMING -u GGML_PQ_S1_PARTIALS \
+		GGML_PQ_STRIPE=1 GGML_PQ_NUMA_LUT="$(GGML_PQ_NUMA_LUT)" \
+		OMP_DYNAMIC=FALSE OMP_PROC_BIND=spread OMP_PLACES=cores \
 		./llama_pq --fp16 "$(FP16_MODEL)" --q2 "$(Q2_MODEL)" --pq "$(PQ_MODEL)" \
 		--threads "$(AE_THREADS)" --repetitions "$(AE_REPETITIONS)" \
 		--warmup "$(AE_WARMUP)" --generations "$(AE_GENERATIONS)" \
@@ -402,6 +407,15 @@ kunpeng-check:
 	@command -v $(CXX) >/dev/null || { echo "[ERROR] C++ compiler not found: $(CXX)" >&2; exit 1; }
 	@(grep -E 'Features|Flags' /proc/cpuinfo 2>/dev/null | head -3) || true
 	@echo "[OK] Host toolchain ready for Kunpeng NEON PQ path (pq-gemv-arm.cpp)"
+	@grep -q 'int32_t iacc\[kS1OutTile\]' llama.cpp/ggml/src/ggml-cpu/pq-gemv-arm.cpp && { \
+		echo "[ERROR] pq-gemv-arm.cpp still has int32 phase2 (expect ~7 tok/s). Use float pq_fma_lut16_f32 path (see 6b942c9)." >&2; \
+		exit 1; \
+	} || true
+	@grep -q 'pq_fma_lut16_f32' llama.cpp/ggml/src/ggml-cpu/pq-gemv-arm.cpp || { \
+		echo "[ERROR] pq-gemv-arm.cpp missing pq_fma_lut16_f32 in shared phase2" >&2; \
+		exit 1; \
+	}
+	@echo "[OK] PQ shared phase2 source check (float FMA, not int32 iacc)"
 
 kunpeng-verify-isa: kunpeng-build
 	@test -f "$(LLAMA_BUILD)/compile_commands.json" || { \

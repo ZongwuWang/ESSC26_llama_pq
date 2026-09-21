@@ -16,8 +16,6 @@
 
 namespace {
 
-constexpr int PQ_K = GGML_PQ_K;
-
 void parallel_for(int n_items, const std::function<void(int, int)> & fn) {
     int nth = (int) std::thread::hardware_concurrency();
     if (nth < 1) nth = 1;
@@ -37,12 +35,12 @@ void parallel_for(int n_items, const std::function<void(int, int)> & fn) {
 
 // per-subspace k-means: grid init (L levels per dim, L^ds <= K, mixed-radix
 // index), then `iters` Lloyd refinements. pts: n x ds (row-major).
-void kmeans_subspace(const float * pts, int n, int ds, int iters, float * cb) {
+void kmeans_subspace(const float * pts, int n, int ds, int K, int iters, float * cb) {
     int L = 1;
-    while (L < PQ_K) {
+    while (L < K) {
         double p = 1;
         for (int d = 0; d < ds; d++) p *= (double)(L + 1);
-        if (p <= (double) PQ_K) L++; else break;
+        if (p <= (double) K) L++; else break;
     }
 
     float lo[GGML_PQ_MAX_DS], hi[GGML_PQ_MAX_DS];
@@ -55,7 +53,7 @@ void kmeans_subspace(const float * pts, int n, int ds, int iters, float * cb) {
         }
     }
     // grid init: centroid k = sum_d l_d * L^d, l_d on a uniform grid
-    for (int k = 0; k < PQ_K; k++) {
+    for (int k = 0; k < K; k++) {
         for (int d = 0; d < ds; d++) {
             const int stride = (int) std::pow((double) L, d);
             const int l = (k / stride) % L;
@@ -64,8 +62,8 @@ void kmeans_subspace(const float * pts, int n, int ds, int iters, float * cb) {
     }
 
     // Lloyd iterations
-    std::vector<float> sums((size_t) PQ_K * ds);
-    std::vector<int>   cnt(PQ_K);
+    std::vector<float> sums((size_t) K * ds);
+    std::vector<int>   cnt(K);
     for (int it = 0; it < iters; it++) {
         std::fill(sums.begin(), sums.end(), 0.f);
         std::fill(cnt.begin(), cnt.end(), 0);
@@ -73,7 +71,7 @@ void kmeans_subspace(const float * pts, int n, int ds, int iters, float * cb) {
             const float * pt = pts + (size_t) p * ds;
             int best = 0;
             float bd = 1e30f;
-            for (int k = 0; k < PQ_K; k++) {
+            for (int k = 0; k < K; k++) {
                 float dd = 0.f;
                 for (int d = 0; d < ds; d++) {
                     const float e = pt[d] - cb[(size_t) k * ds + d];
@@ -85,7 +83,7 @@ void kmeans_subspace(const float * pts, int n, int ds, int iters, float * cb) {
             for (int d = 0; d < ds; d++) sums[(size_t) best * ds + d] += pt[d];
             cnt[best]++;
         }
-        for (int k = 0; k < PQ_K; k++) {
+        for (int k = 0; k < K; k++) {
             if (cnt[k] > 0) {
                 for (int d = 0; d < ds; d++)
                     cb[(size_t) k * ds + d] = sums[(size_t) k * ds + d] / cnt[k];
@@ -94,10 +92,10 @@ void kmeans_subspace(const float * pts, int n, int ds, int iters, float * cb) {
     }
 }
 
-int nearest_centroid(const float * pt, const float * cb, int ds) {
+int nearest_centroid(const float * pt, const float * cb, int ds, int K) {
     int best = 0;
     float bd = 1e30f;
-    for (int k = 0; k < PQ_K; k++) {
+    for (int k = 0; k < K; k++) {
         float dd = 0.f;
         for (int d = 0; d < ds; d++) {
             const float e = pt[d] - cb[(size_t) k * ds + d];
@@ -112,11 +110,11 @@ int nearest_centroid(const float * pt, const float * cb, int ds) {
 constexpr int kIters = 2;
 
 // S2: subspace i covers output rows [i*ds, i*ds+ds); points = columns.
-bool pq_s2_quantize(const float * W, int n_out, int n_in, int ds,
+bool pq_s2_quantize(const float * W, int n_out, int n_in, int ds, int K,
                     std::vector<int8_t> & cb8, std::vector<float> & inv,
                     std::vector<uint8_t> & idx) {
     const int M = n_out / ds;
-    std::vector<float> cb((size_t) M * PQ_K * ds);
+    std::vector<float> cb((size_t) M * K * ds);
     idx.assign((size_t) M * n_in, 0);
 
     parallel_for(M, [&](int i0, int i1) {
@@ -125,26 +123,26 @@ bool pq_s2_quantize(const float * W, int n_out, int n_in, int ds,
             for (int p = 0; p < n_in; p++)
                 for (int s = 0; s < ds; s++)
                     pts[(size_t) p * ds + s] = W[(size_t)(i * ds + s) * n_in + p];
-            float * cb_i = &cb[(size_t) i * PQ_K * ds];
-            kmeans_subspace(pts.data(), n_in, ds, kIters, cb_i);
+            float * cb_i = &cb[(size_t) i * K * ds];
+            kmeans_subspace(pts.data(), n_in, ds, K, kIters, cb_i);
             for (int p = 0; p < n_in; p++)
-                idx[(size_t) i * n_in + p] = (uint8_t) nearest_centroid(pts.data() + (size_t) p * ds, cb_i, ds);
+                idx[(size_t) i * n_in + p] = (uint8_t) nearest_centroid(pts.data() + (size_t) p * ds, cb_i, ds, K);
         }
     });
 
     // pack per-(i,side) int8 + dequant scale
-    cb8.assign((size_t) M * ds * PQ_K, 0);
+    cb8.assign((size_t) M * ds * K, 0);
     inv.resize((size_t) M * ds);
     for (int i = 0; i < M; i++) {
         for (int s = 0; s < ds; s++) {
             float amax = 0.f;
-            for (int k = 0; k < PQ_K; k++)
-                amax = std::max(amax, std::abs(cb[(size_t)(i * PQ_K + k) * ds + s]));
+            for (int k = 0; k < K; k++)
+                amax = std::max(amax, std::abs(cb[(size_t)(i * K + k) * ds + s]));
             inv[(size_t) i * ds + s] = (amax > 0) ? amax / 127.0f : 0.0f;
             const float sc = (amax > 0) ? 127.0f / amax : 0.0f;
-            for (int k = 0; k < PQ_K; k++) {
-                int v = (int) std::lround(cb[(size_t)(i * PQ_K + k) * ds + s] * sc);
-                cb8[((size_t) i * ds + s) * PQ_K + k] = (int8_t) std::max(-127, std::min(127, v));
+            for (int k = 0; k < K; k++) {
+                int v = (int) std::lround(cb[(size_t)(i * K + k) * ds + s] * sc);
+                cb8[((size_t) i * ds + s) * K + k] = (int8_t) std::max(-127, std::min(127, v));
             }
         }
     }
@@ -152,10 +150,10 @@ bool pq_s2_quantize(const float * W, int n_out, int n_in, int ds,
 }
 
 // S1: subspace i covers input cols [i*ds, i*ds+ds); points = weight rows.
-bool pq_s1_quantize(const float * W, int n_out, int n_in, int ds,
+bool pq_s1_quantize(const float * W, int n_out, int n_in, int ds, int K,
                     std::vector<float> & cbf, std::vector<uint8_t> & idx) {
     const int M = n_in / ds;
-    cbf.assign((size_t) M * PQ_K * ds, 0.f);
+    cbf.assign((size_t) M * K * ds, 0.f);
     idx.assign((size_t) M * n_out, 0);
 
     parallel_for(M, [&](int i0, int i1) {
@@ -164,10 +162,10 @@ bool pq_s1_quantize(const float * W, int n_out, int n_in, int ds,
             for (int j = 0; j < n_out; j++)
                 for (int d = 0; d < ds; d++)
                     pts[(size_t) j * ds + d] = W[(size_t) j * n_in + i * ds + d];
-            float * cb_i = &cbf[(size_t) i * PQ_K * ds];
-            kmeans_subspace(pts.data(), n_out, ds, kIters, cb_i);
+            float * cb_i = &cbf[(size_t) i * K * ds];
+            kmeans_subspace(pts.data(), n_out, ds, K, kIters, cb_i);
             for (int j = 0; j < n_out; j++)
-                idx[(size_t) i * n_out + j] = (uint8_t) nearest_centroid(pts.data() + (size_t) j * ds, cb_i, ds);
+                idx[(size_t) i * n_out + j] = (uint8_t) nearest_centroid(pts.data() + (size_t) j * ds, cb_i, ds, K);
         }
     });
     return true;
@@ -189,11 +187,12 @@ void llama_pq_finish(void) {
 }
 
 bool llama_pq_build_pack(struct ggml_tensor * t, int mode, int ds,
-                         llama_pq_pack & out) {
+                         llama_pq_pack & out, int K) {
     out = llama_pq_pack{};
     if (!t || !t->data) return false;
     if (t->ne[2] != 1 || t->ne[3] != 1) return false;
     if (!ggml_is_contiguous(t)) return false;
+    if (K != GGML_PQ_K && K != GGML_PQ_K_ARM) return false;
 
     const int64_t n_out = t->ne[1]; // rows
     const int64_t n_in  = t->ne[0]; // cols
@@ -209,25 +208,26 @@ bool llama_pq_build_pack(struct ggml_tensor * t, int mode, int ds,
 
     out.mode = mode;
     out.ds   = ds;
+    out.K    = K;
     out.n_in = n_in;
     out.n_out = n_out;
     if (mode == 0) {
-        pq_s1_quantize(W.data(), (int) n_out, (int) n_in, ds, out.cbf, out.idx);
+        pq_s1_quantize(W.data(), (int) n_out, (int) n_in, ds, K, out.cbf, out.idx);
     } else {
-        pq_s2_quantize(W.data(), (int) n_out, (int) n_in, ds, out.cb8, out.inv, out.idx);
+        pq_s2_quantize(W.data(), (int) n_out, (int) n_in, ds, K, out.cb8, out.inv, out.idx);
     }
     return true;
 }
 
-bool llama_pq_register_tensor(struct ggml_tensor * t, int mode, int ds) {
+bool llama_pq_register_tensor(struct ggml_tensor * t, int mode, int ds, int K) {
     llama_pq_pack pack;
-    if (!llama_pq_build_pack(t, mode, ds, pack)) return false;
+    if (!llama_pq_build_pack(t, mode, ds, pack, K)) return false;
     if (pack.mode == 0) {
         return ggml_pq_register(t->name, 0, pack.ds, pack.cbf.data(), nullptr,
-                                nullptr, pack.idx.data(), pack.n_in, pack.n_out);
+                                nullptr, pack.idx.data(), pack.n_in, pack.n_out, K);
     }
     return ggml_pq_register(t->name, 1, pack.ds, nullptr, pack.cb8.data(),
-                            pack.inv.data(), pack.idx.data(), pack.n_in, pack.n_out);
+                            pack.inv.data(), pack.idx.data(), pack.n_in, pack.n_out, K);
 }
 
 // ---------------------------------------------------------------------------
@@ -277,7 +277,7 @@ bool llama_pq_register_from_loader(struct llama_model_loader & ml,
     const int K    = meta[2];
     if (ds_out) *ds_out = ds;
     if (mode == 4) {
-        if (ds != 4 || K != GGML_PQ_K) return false;
+        if (ds != 4 || (K != GGML_PQ_K && K != GGML_PQ_K_ARM)) return false;
         const int64_t n_in = ml.get_tensor_meta(base)->ne[0];
         const int64_t n_out = ml.get_tensor_meta(base)->ne[1];
         const int M = (int)(n_in / ds);
@@ -287,14 +287,15 @@ bool llama_pq_register_from_loader(struct llama_model_loader & ml,
         std::vector<uint8_t> idx((size_t)M * n_out);
         if (!pq_read_side(ml, nm, idx.data(), idx.size(), GGML_TYPE_I8)) return false;
         llama_pq_side_name(nm, sizeof(nm), base, "pq_cb");
-        std::vector<ggml_fp16_t> cb((size_t)n_in * GGML_PQ_K);
+        std::vector<ggml_fp16_t> cb((size_t)n_in * K);
         if (!pq_read_side(ml, nm, cb.data(), cb.size() * sizeof(ggml_fp16_t), GGML_TYPE_F16)) return false;
         llama_pq_side_name(nm, sizeof(nm), base, "pq_row_scale");
         std::vector<float> row_scale((size_t)n_out);
         if (!pq_read_side(ml, nm, row_scale.data(), row_scale.size() * sizeof(float), GGML_TYPE_F32)) return false;
-        return ggml_pq_register_raw_scaled(base, ds, cb.data(), idx.data(), row_scale.data(), n_in, n_out);
+        return ggml_pq_register_raw_scaled(base, ds, cb.data(), idx.data(), row_scale.data(), n_in, n_out, K);
     }
-    if (mode < 0 || mode > 1 || ds < 1 || ds > GGML_PQ_MAX_DS || K != GGML_PQ_K) {
+    if (mode < 0 || mode > 1 || ds < 1 || ds > GGML_PQ_MAX_DS ||
+        (K != GGML_PQ_K && K != GGML_PQ_K_ARM)) {
         LLAMA_LOG_WARN("%s: unsupported PQ meta for '%s' (mode=%d ds=%d K=%d)\n",
                        __func__, base, mode, ds, K);
         return false;
@@ -317,11 +318,11 @@ bool llama_pq_register_from_loader(struct llama_model_loader & ml,
         pack.idx.resize((size_t) M * it->ne[0]);
         if (!pq_read_side(ml, nm, pack.idx.data(), pack.idx.size(), GGML_TYPE_I8)) return false;
         llama_pq_side_name(nm, sizeof(nm), base, "pq_cb");
-        pack.cbf.resize((size_t) M * GGML_PQ_K * ds);
+        pack.cbf.resize((size_t) M * K * ds);
         if (!pq_read_side(ml, nm, pack.cbf.data(),
                           pack.cbf.size() * sizeof(float), GGML_TYPE_F32)) return false;
         return ggml_pq_register(base, 0, ds, pack.cbf.data(), nullptr, nullptr,
-                                pack.idx.data(), pack.n_in, pack.n_out);
+                                pack.idx.data(), pack.n_in, pack.n_out, K);
     }
     pack.n_in = it ? it->ne[0] : -1;
     if (pack.n_in < 0 || it->ne[1] != M) return false;
@@ -329,14 +330,14 @@ bool llama_pq_register_from_loader(struct llama_model_loader & ml,
     if (!pq_read_side(ml, nm, pack.idx.data(), pack.idx.size(), GGML_TYPE_I8)) return false;
 
     llama_pq_side_name(nm, sizeof(nm), base, "pq_cb");
-    pack.cb8.resize((size_t) M * ds * GGML_PQ_K);
+    pack.cb8.resize((size_t) M * ds * K);
     if (!pq_read_side(ml, nm, pack.cb8.data(), pack.cb8.size(), GGML_TYPE_I8)) return false;
     llama_pq_side_name(nm, sizeof(nm), base, "pq_inv");
     pack.inv.resize((size_t) M * ds);
     if (!pq_read_side(ml, nm, pack.inv.data(), pack.inv.size() * sizeof(float), GGML_TYPE_F32)) return false;
 
     return ggml_pq_register(base, 1, ds, nullptr, pack.cb8.data(), pack.inv.data(),
-                            pack.idx.data(), pack.n_in, pack.n_out);
+                            pack.idx.data(), pack.n_in, pack.n_out, K);
 }
 
 // ---------------------------------------------------------------------------
@@ -406,7 +407,7 @@ bool llama_pq_register_qkv_group(struct llama_model_loader & ml,
         int mds = 0;
         if (!llama_pq_register_from_loader(ml, t->name, &mds)) {
             // no side tensors: fall back to on-the-fly k-means
-            if (!llama_pq_register_tensor(t, 0, 2)) return false;
+            if (!llama_pq_register_tensor(t, 0, 2, GGML_PQ_K)) return false;
             mds = 2;
         }
         if (ds == 0) ds = mds;
@@ -430,7 +431,7 @@ bool llama_pq_register_fused_group(struct llama_model_loader & ml,
         int mds = 0;
         if (!llama_pq_register_from_loader(ml, members[m]->name, &mds)) {
             // no side tensors: fall back to on-the-fly k-means
-            if (!llama_pq_register_tensor(members[m], 0, 2)) return false;
+            if (!llama_pq_register_tensor(members[m], 0, 2, GGML_PQ_K)) return false;
             mds = 2;
         }
         if (ds == 0) ds = mds;

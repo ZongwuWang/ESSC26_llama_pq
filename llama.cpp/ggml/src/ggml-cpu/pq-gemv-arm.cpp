@@ -1,8 +1,9 @@
 // PQ decode-time GEMV for ARM64 (Huawei Kunpeng / aarch64).
 //
 // Mirrors the public ggml_pq_* API in pq-gemv.cpp (AVX-512 x86 path).
-// S1 (EdgePQ-4c8b, ds=4): 4-subspace yl amortization, fp16 FMA accumulate,
-// fused build+quantize, register-resident 256-LUT, software prefetch.
+// S1 (EdgePQ-4c8b, ds=4): shared LUT + output-owned accumulate by default
+// (set GGML_PQ_S1_PARTIALS=1 for the legacy nth partial-y reduce). NUMA: LUT
+// scratch is replicated per node (disable with GGML_PQ_NUMA_LUT=0).
 #include "ggml-pq.h"
 
 #if defined(__aarch64__)
@@ -12,6 +13,9 @@
 #include <arm_sve.h>
 #endif
 #include <sys/mman.h>
+#include <sys/stat.h>
+#include <sched.h>
+#include <unistd.h>
 #include <algorithm>
 #include <atomic>
 #include <cmath>
@@ -83,6 +87,7 @@ struct PQTensor {
     std::string name;
     int      mode = 0;
     int      ds = 2;
+    int      K = GGML_PQ_K; // 256 (x86/default) or 64 (Kunpeng NEON-friendly)
     int64_t  n_in = 0, n_out = 0;
     int             n_seg = 0;
     const PQTensor * seg_t[4];
@@ -100,10 +105,20 @@ std::unordered_map<std::string, PQTensor> g_pq;
 std::atomic<bool> g_pq_enabled{false};
 
 constexpr int kMaxThreads = 1024; // Kunpeng nodes can expose 640+ logical CPUs
+constexpr int kMaxNumaNodes = 8;
+constexpr int kS1OutTile = 256; // amortize LUT load across a large output tile
 
-// fp16 partials (matches x86): halves phase2 reduce traffic vs float32.
+// Legacy fp16 partials path (GGML_PQ_S1_PARTIALS=1): halves phase2 traffic vs float32.
 std::vector<pq_f16> g_s1_partials;
 std::mutex          g_s1_mu;
+
+// Shared-LUT scratch: per-NUMA-node replicas of dt8[M][256] + inv[M] for up to 4
+// fused S1 tensors. Phase1 writes every replica; phase2 reads the local node copy.
+struct S1LutScratch {
+    std::vector<int8_t> dt8;
+    std::vector<float>  inv;
+};
+static S1LutScratch g_s1_luts[kMaxNumaNodes][4];
 
 struct MulmatAcc { uint64_t busy_us = 0, count = 0; };
 static std::map<std::string, MulmatAcc> g_mulmat_acc;
@@ -114,6 +129,66 @@ static inline void pq_barrier(void * threadpool, int nth) {
         return;
     }
     ggml_barrier((struct ggml_threadpool *) threadpool);
+}
+
+static int pq_numa_n_nodes(void) {
+    static const bool g_no_numa = getenv("GGML_PQ_NUMA_LUT") != nullptr &&
+                                  getenv("GGML_PQ_NUMA_LUT")[0] == '0';
+    if (g_no_numa) {
+        return 1;
+    }
+    static int cached = -1;
+    if (cached >= 0) {
+        return cached;
+    }
+    int n = 0;
+    for (; n < kMaxNumaNodes; n++) {
+        char path[64];
+        snprintf(path, sizeof(path), "/sys/devices/system/node/node%d", n);
+        struct stat st;
+        if (stat(path, &st) != 0) {
+            break;
+        }
+    }
+    cached = n > 0 ? n : 1;
+    return cached;
+}
+
+static int pq_numa_node(void) {
+    unsigned cpu = 0, node = 0;
+#if defined(__linux__)
+    if (getcpu(&cpu, &node) == 0) {
+        const int n = pq_numa_n_nodes();
+        if ((int) node >= 0 && (int) node < n) {
+            return (int) node;
+        }
+    }
+#else
+    (void) cpu;
+    (void) node;
+#endif
+    return 0;
+}
+
+static bool pq_s1_use_partials(void) {
+    static const bool v = getenv("GGML_PQ_S1_PARTIALS") != nullptr;
+    return v;
+}
+
+static void pq_s1_ensure_luts(int n_nodes, int slot, int M, int K) {
+    const size_t want_dt = (size_t) M * (size_t) K;
+    for (int node = 0; node < n_nodes; node++) {
+        S1LutScratch & s = g_s1_luts[node][slot];
+        if (s.dt8.size() < want_dt) {
+            s.dt8.resize(want_dt);
+            s.inv.resize((size_t) M);
+            // First-touch on the allocating thread; phase1 overwrites all rows.
+            std::fill(s.dt8.begin(), s.dt8.end(), (int8_t) 0);
+            std::fill(s.inv.begin(), s.inv.end(), 0.f);
+        } else if ((int) s.inv.size() < M) {
+            s.inv.resize((size_t) M, 0.f);
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -140,6 +215,23 @@ static inline int8x16_t pq_lut256_lookup(const PqLut256 & L, uint8x16_t idx) {
     const uint8x16_t r2 = vqtbl4q_u8(L.t2, vsubq_u8(idx, vdupq_n_u8(128)));
     const uint8x16_t r3 = vqtbl4q_u8(L.t3, vsubq_u8(idx, vdupq_n_u8(192)));
     return vreinterpretq_s8_u8(vorrq_u8(vorrq_u8(r0, r1), vorrq_u8(r2, r3)));
+}
+
+// K=64: one vqtbl4q covers the full codebook (indices must be in [0,63]).
+struct PqLut64 {
+    uint8x16x4_t t;
+};
+
+__attribute__((always_inline))
+static inline PqLut64 pq_lut64_load(const int8_t * table) {
+    PqLut64 L;
+    L.t = vld1q_u8_x4((const uint8_t *) table);
+    return L;
+}
+
+__attribute__((always_inline))
+static inline int8x16_t pq_lut64_lookup(const PqLut64 & L, uint8x16_t idx) {
+    return vreinterpretq_s8_u8(vqtbl4q_u8(L.t, idx));
 }
 
 static inline void pq_prefetch_t0(const void * p) { __builtin_prefetch(p, 0, 3); }
@@ -214,31 +306,31 @@ static inline void pq_fma_lut16_f32(float32x4_t & y0, float32x4_t & y1,
 }
 
 static void pq_build_dt_scalar(int ds, const pq_f16 * xh, const pq_f16 * cbh,
-                               int subspace, float * dt) {
-    for (int k = 0; k < GGML_PQ_K; k++) {
+                               int subspace, int K, float * dt) {
+    for (int k = 0; k < K; k++) {
         float s = 0.f;
         for (int d = 0; d < ds; d++) {
             s += pq_to_f32(xh[(size_t) subspace * ds + d]) *
-                 pq_to_f32(cbh[((size_t)(subspace * ds + d) * GGML_PQ_K) + k]);
+                 pq_to_f32(cbh[((size_t)(subspace * ds + d) * K) + k]);
         }
         dt[k] = s;
     }
 }
 
-static void pq_quantize_dt(const float * dt, int8_t * dt8, float * inv_out) {
+static void pq_quantize_dt(const float * dt, int K, int8_t * dt8, float * inv_out) {
     float32x4_t vmax = vdupq_n_f32(0.f);
-    for (int k = 0; k < GGML_PQ_K; k += 4) {
+    for (int k = 0; k < K; k += 4) {
         vmax = vmaxq_f32(vmax, vabsq_f32(vld1q_f32(dt + k)));
     }
     const float amax = vmaxvq_f32(vmax);
     if (!(amax > 0.f)) {
-        memset(dt8, 0, GGML_PQ_K);
+        memset(dt8, 0, (size_t) K);
         *inv_out = 0.f;
         return;
     }
     *inv_out = amax / 127.0f;
     const float32x4_t vsc = vdupq_n_f32(127.0f / amax);
-    for (int k = 0; k < GGML_PQ_K; k += 16) {
+    for (int k = 0; k < K; k += 16) {
         const int32x4_t i0 = vcvtnq_s32_f32(vmulq_f32(vld1q_f32(dt + k + 0), vsc));
         const int32x4_t i1 = vcvtnq_s32_f32(vmulq_f32(vld1q_f32(dt + k + 4), vsc));
         const int32x4_t i2 = vcvtnq_s32_f32(vmulq_f32(vld1q_f32(dt + k + 8), vsc));
@@ -249,21 +341,21 @@ static void pq_quantize_dt(const float * dt, int8_t * dt8, float * inv_out) {
     }
 }
 
-// Build dt[256] + quantize; absmax tracked during the build pass.
+// Build dt[K] + quantize; absmax tracked during the build pass. K in {64,256}.
 static void pq_build_quant_ds4(const pq_f16 * xh, const pq_f16 * cbh,
-                               int subspace, int8_t * dt8, float * inv_out) {
+                               int subspace, int K, int8_t * dt8, float * inv_out) {
     const float32x4_t vx0 = vdupq_n_f32(pq_to_f32(xh[(size_t) subspace * 4 + 0]));
     const float32x4_t vx1 = vdupq_n_f32(pq_to_f32(xh[(size_t) subspace * 4 + 1]));
     const float32x4_t vx2 = vdupq_n_f32(pq_to_f32(xh[(size_t) subspace * 4 + 2]));
     const float32x4_t vx3 = vdupq_n_f32(pq_to_f32(xh[(size_t) subspace * 4 + 3]));
-    const pq_f16 * c0 = cbh + (size_t) (subspace * 4 + 0) * GGML_PQ_K;
-    const pq_f16 * c1 = cbh + (size_t) (subspace * 4 + 1) * GGML_PQ_K;
-    const pq_f16 * c2 = cbh + (size_t) (subspace * 4 + 2) * GGML_PQ_K;
-    const pq_f16 * c3 = cbh + (size_t) (subspace * 4 + 3) * GGML_PQ_K;
+    const pq_f16 * c0 = cbh + (size_t) (subspace * 4 + 0) * K;
+    const pq_f16 * c1 = cbh + (size_t) (subspace * 4 + 1) * K;
+    const pq_f16 * c2 = cbh + (size_t) (subspace * 4 + 2) * K;
+    const pq_f16 * c3 = cbh + (size_t) (subspace * 4 + 3) * K;
 
     alignas(16) float dt[GGML_PQ_K];
     float32x4_t vmax = vdupq_n_f32(0.f);
-    for (int k = 0; k < GGML_PQ_K; k += 8) {
+    for (int k = 0; k < K; k += 8) {
         float32x4_t v0 = vmulq_f32(vx0, pq_load_f16x4(c0 + k));
         v0 = vfmaq_f32(v0, vx1, pq_load_f16x4(c1 + k));
         v0 = vfmaq_f32(v0, vx2, pq_load_f16x4(c2 + k));
@@ -279,13 +371,13 @@ static void pq_build_quant_ds4(const pq_f16 * xh, const pq_f16 * cbh,
     }
     const float amax = vmaxvq_f32(vmax);
     if (!(amax > 0.f)) {
-        memset(dt8, 0, GGML_PQ_K);
+        memset(dt8, 0, (size_t) K);
         *inv_out = 0.f;
         return;
     }
     *inv_out = amax / 127.0f;
     const float32x4_t vsc = vdupq_n_f32(127.0f / amax);
-    for (int k = 0; k < GGML_PQ_K; k += 16) {
+    for (int k = 0; k < K; k += 16) {
         const int32x4_t i0 = vcvtnq_s32_f32(vmulq_f32(vld1q_f32(dt + k + 0), vsc));
         const int32x4_t i1 = vcvtnq_s32_f32(vmulq_f32(vld1q_f32(dt + k + 4), vsc));
         const int32x4_t i2 = vcvtnq_s32_f32(vmulq_f32(vld1q_f32(dt + k + 8), vsc));
@@ -299,6 +391,7 @@ static void pq_build_quant_ds4(const pq_f16 * xh, const pq_f16 * cbh,
 static void pq_s1_accumulate_subspace(const PQTensor & t, const pq_f16 * xh,
                                       int subspace, pq_f16 * yl) {
     const int ds = t.ds;
+    const int K = t.K;
     const int dout = (int) t.n_out;
     const pq_f16 * cbh = t.cbh.data();
     const uint8_t * idx = t.idx.data();
@@ -306,51 +399,86 @@ static void pq_s1_accumulate_subspace(const PQTensor & t, const pq_f16 * xh,
     alignas(16) int8_t dt8[GGML_PQ_K];
     float inv = 0.f;
     if (ds == 4) {
-        pq_build_quant_ds4(xh, cbh, subspace, dt8, &inv);
+        pq_build_quant_ds4(xh, cbh, subspace, K, dt8, &inv);
     } else {
         float dt[GGML_PQ_K];
-        pq_build_dt_scalar(ds, xh, cbh, subspace, dt);
-        pq_quantize_dt(dt, dt8, &inv);
+        pq_build_dt_scalar(ds, xh, cbh, subspace, K, dt);
+        pq_quantize_dt(dt, K, dt8, &inv);
     }
-    const PqLut256 L = pq_lut256_load(dt8);
     const uint8_t * ii = idx + (size_t) subspace * dout;
 
     int j = 0;
+    if (K == 64) {
+        const PqLut64 L = pq_lut64_load(dt8);
 #if defined(__ARM_FEATURE_FP16_VECTOR_ARITHMETIC)
-    const float16_t hinv = (float16_t) inv;
-    for (; j + 15 < dout; j += 16) {
-        if (j + 128 < dout) {
-            pq_prefetch_t0(ii + j + 128);
+        const float16_t hinv = (float16_t) inv;
+        for (; j + 15 < dout; j += 16) {
+            float16x8_t y0 = vld1q_f16((const __fp16 *) (yl + j));
+            float16x8_t y1 = vld1q_f16((const __fp16 *) (yl + j + 8));
+            const int8x16_t qv = pq_lut64_lookup(L, vld1q_u8(ii + j));
+            float16x8_t lo, hi;
+            pq_i8_to_f16x8x2(qv, lo, hi);
+            y0 = vfmaq_n_f16(y0, lo, hinv);
+            y1 = vfmaq_n_f16(y1, hi, hinv);
+            vst1q_f16((__fp16 *) (yl + j), y0);
+            vst1q_f16((__fp16 *) (yl + j + 8), y1);
         }
-        float16x8_t y0 = vld1q_f16((const __fp16 *) (yl + j));
-        float16x8_t y1 = vld1q_f16((const __fp16 *) (yl + j + 8));
-        pq_fma_lut16_f16(y0, y1, L, ii + j, hinv);
-        vst1q_f16((__fp16 *) (yl + j), y0);
-        vst1q_f16((__fp16 *) (yl + j + 8), y1);
-    }
 #else
-    for (; j + 15 < dout; j += 16) {
-        if (j + 128 < dout) {
-            pq_prefetch_t0(ii + j + 128);
+        for (; j + 15 < dout; j += 16) {
+            float tmp[16];
+            for (int t_ = 0; t_ < 16; t_++) tmp[t_] = pq_to_f32(yl[j + t_]);
+            float32x4_t y0 = vld1q_f32(tmp + 0), y1 = vld1q_f32(tmp + 4);
+            float32x4_t y2 = vld1q_f32(tmp + 8), y3 = vld1q_f32(tmp + 12);
+            const int8x16_t qv = pq_lut64_lookup(L, vld1q_u8(ii + j));
+            const int16x8_t qlo = vmovl_s8(vget_low_s8(qv));
+            const int16x8_t qhi = vmovl_high_s8(qv);
+            y0 = vfmaq_n_f32(y0, vcvtq_f32_s32(vmovl_s16(vget_low_s16(qlo))), inv);
+            y1 = vfmaq_n_f32(y1, vcvtq_f32_s32(vmovl_high_s16(qlo)), inv);
+            y2 = vfmaq_n_f32(y2, vcvtq_f32_s32(vmovl_s16(vget_low_s16(qhi))), inv);
+            y3 = vfmaq_n_f32(y3, vcvtq_f32_s32(vmovl_high_s16(qhi)), inv);
+            vst1q_f32(tmp + 0, y0); vst1q_f32(tmp + 4, y1);
+            vst1q_f32(tmp + 8, y2); vst1q_f32(tmp + 12, y3);
+            for (int t_ = 0; t_ < 16; t_++) yl[j + t_] = pq_from_f32(tmp[t_]);
         }
-        float tmp[16];
-        for (int t = 0; t < 16; t++) {
-            tmp[t] = pq_to_f32(yl[j + t]);
-        }
-        float32x4_t y0 = vld1q_f32(tmp + 0);
-        float32x4_t y1 = vld1q_f32(tmp + 4);
-        float32x4_t y2 = vld1q_f32(tmp + 8);
-        float32x4_t y3 = vld1q_f32(tmp + 12);
-        pq_fma_lut16_f32(y0, y1, y2, y3, L, ii + j, inv);
-        vst1q_f32(tmp + 0, y0);
-        vst1q_f32(tmp + 4, y1);
-        vst1q_f32(tmp + 8, y2);
-        vst1q_f32(tmp + 12, y3);
-        for (int t = 0; t < 16; t++) {
-            yl[j + t] = pq_from_f32(tmp[t]);
-        }
-    }
 #endif
+    } else {
+        const PqLut256 L = pq_lut256_load(dt8);
+#if defined(__ARM_FEATURE_FP16_VECTOR_ARITHMETIC)
+        const float16_t hinv = (float16_t) inv;
+        for (; j + 15 < dout; j += 16) {
+            if (j + 128 < dout) {
+                pq_prefetch_t0(ii + j + 128);
+            }
+            float16x8_t y0 = vld1q_f16((const __fp16 *) (yl + j));
+            float16x8_t y1 = vld1q_f16((const __fp16 *) (yl + j + 8));
+            pq_fma_lut16_f16(y0, y1, L, ii + j, hinv);
+            vst1q_f16((__fp16 *) (yl + j), y0);
+            vst1q_f16((__fp16 *) (yl + j + 8), y1);
+        }
+#else
+        for (; j + 15 < dout; j += 16) {
+            if (j + 128 < dout) {
+                pq_prefetch_t0(ii + j + 128);
+            }
+            float tmp[16];
+            for (int t_ = 0; t_ < 16; t_++) {
+                tmp[t_] = pq_to_f32(yl[j + t_]);
+            }
+            float32x4_t y0 = vld1q_f32(tmp + 0);
+            float32x4_t y1 = vld1q_f32(tmp + 4);
+            float32x4_t y2 = vld1q_f32(tmp + 8);
+            float32x4_t y3 = vld1q_f32(tmp + 12);
+            pq_fma_lut16_f32(y0, y1, y2, y3, L, ii + j, inv);
+            vst1q_f32(tmp + 0, y0);
+            vst1q_f32(tmp + 4, y1);
+            vst1q_f32(tmp + 8, y2);
+            vst1q_f32(tmp + 12, y3);
+            for (int t_ = 0; t_ < 16; t_++) {
+                yl[j + t_] = pq_from_f32(tmp[t_]);
+            }
+        }
+#endif
+    }
     for (; j < dout; j++) {
         yl[j] = pq_from_f32(pq_to_f32(yl[j]) + (float) dt8[ii[j]] * inv);
     }
@@ -360,6 +488,13 @@ static void pq_s1_accumulate_subspace(const PQTensor & t, const pq_f16 * xh,
 // Tile=64 keeps yl in regs; each LUT is loaded once per tile (4x reuse).
 static void pq_s1_phase1_ds4_block(const PQTensor & t, const pq_f16 * xh,
                                    int i0, int i1, pq_f16 * yl) {
+    const int K = t.K;
+    if (K != GGML_PQ_K) {
+        for (int i = i0; i < i1; i++) {
+            pq_s1_accumulate_subspace(t, xh, i, yl);
+        }
+        return;
+    }
     const int dout = (int) t.n_out;
     const pq_f16 * cbh = t.cbh.data();
     const uint8_t * idx = t.idx.data();
@@ -367,17 +502,17 @@ static void pq_s1_phase1_ds4_block(const PQTensor & t, const pq_f16 * xh,
     for (; i + 3 < i1; i += 4) {
         if (i + 4 < i1) {
             pq_prefetch_t0(idx + (size_t) (i + 4) * dout);
-            pq_prefetch_t0(cbh + (size_t) (i + 4) * 4 * GGML_PQ_K);
+            pq_prefetch_t0(cbh + (size_t) (i + 4) * 4 * K);
         }
         if (i + 8 < i1) {
             pq_prefetch_t1(idx + (size_t) (i + 8) * dout);
-            pq_prefetch_t1(cbh + (size_t) (i + 8) * 4 * GGML_PQ_K);
+            pq_prefetch_t1(cbh + (size_t) (i + 8) * 4 * K);
         }
 
         alignas(16) int8_t dt8[4][GGML_PQ_K];
         float inv[4];
         for (int s = 0; s < 4; s++) {
-            pq_build_quant_ds4(xh, cbh, i + s, dt8[s], &inv[s]);
+            pq_build_quant_ds4(xh, cbh, i + s, K, dt8[s], &inv[s]);
         }
 
 #if defined(__ARM_FEATURE_FP16_VECTOR_ARITHMETIC)
@@ -572,6 +707,130 @@ static void pq_s1_phase2(const PQTensor & t, float * dst, int j0, int j1,
     }
 }
 
+// Build dt8/inv for subspaces [i0,i1) into every NUMA replica (small write).
+static void pq_s1_publish_luts(const PQTensor & t, const pq_f16 * xh,
+                               int i0, int i1, int slot, int n_nodes) {
+    const pq_f16 * cbh = t.cbh.data();
+    const int ds = t.ds;
+    const int K = t.K;
+    for (int i = i0; i < i1; i++) {
+        alignas(16) int8_t dt8[GGML_PQ_K];
+        float inv = 0.f;
+        if (ds == 4) {
+            pq_build_quant_ds4(xh, cbh, i, K, dt8, &inv);
+        } else {
+            float dt[GGML_PQ_K];
+            pq_build_dt_scalar(ds, xh, cbh, i, K, dt);
+            pq_quantize_dt(dt, K, dt8, &inv);
+        }
+        for (int node = 0; node < n_nodes; node++) {
+            memcpy(g_s1_luts[node][slot].dt8.data() + (size_t) i * K,
+                   dt8, (size_t) K);
+            g_s1_luts[node][slot].inv[(size_t) i] = inv;
+        }
+    }
+}
+
+// Output-owned accumulate over shared LUTs.
+// Phase1-equivalent: int32 accumulate per subspace, then scale by inv once
+// (avoids s8→fp per-FMA). Supports K=256 (4×tbl) and K=64 (1×tbl).
+static void pq_s1_phase2_shared(const PQTensor & t, float * dst, int j0, int j1,
+                                const int8_t * dt8, const float * inv) {
+    const int M = (int) (t.n_in / t.ds);
+    const int K = t.K;
+    const int dout = (int) t.n_out;
+    const uint8_t * idx = t.idx.data();
+
+    for (int jbase = j0; jbase < j1; ) {
+        const int jb = std::min(kS1OutTile, j1 - jbase);
+        alignas(16) float facc[kS1OutTile];
+        for (int z = 0; z < jb; z++) {
+            facc[z] = 0.f;
+        }
+
+        for (int i = 0; i < M; i++) {
+            if (i + 1 < M) {
+                pq_prefetch_t0(dt8 + (size_t) (i + 1) * K);
+                pq_prefetch_t0(idx + (size_t) (i + 1) * dout + jbase);
+            }
+            const float iv = inv[i];
+            const uint8_t * ii = idx + (size_t) i * dout + jbase;
+            const int8_t * row = dt8 + (size_t) i * K;
+
+            alignas(16) int32_t iacc[kS1OutTile];
+            for (int z = 0; z < jb; z++) {
+                iacc[z] = 0;
+            }
+
+            if (K == 64) {
+                const PqLut64 L = pq_lut64_load(row);
+                int off = 0;
+                for (; off + 15 < jb; off += 16) {
+                    const int8x16_t qv = pq_lut64_lookup(L, vld1q_u8(ii + off));
+                    const int16x8_t qlo = vmovl_s8(vget_low_s8(qv));
+                    const int16x8_t qhi = vmovl_high_s8(qv);
+                    int32x4_t a0 = vld1q_s32(iacc + off + 0);
+                    int32x4_t a1 = vld1q_s32(iacc + off + 4);
+                    int32x4_t a2 = vld1q_s32(iacc + off + 8);
+                    int32x4_t a3 = vld1q_s32(iacc + off + 12);
+                    a0 = vaddq_s32(a0, vmovl_s16(vget_low_s16(qlo)));
+                    a1 = vaddq_s32(a1, vmovl_high_s16(qlo));
+                    a2 = vaddq_s32(a2, vmovl_s16(vget_low_s16(qhi)));
+                    a3 = vaddq_s32(a3, vmovl_high_s16(qhi));
+                    vst1q_s32(iacc + off + 0, a0);
+                    vst1q_s32(iacc + off + 4, a1);
+                    vst1q_s32(iacc + off + 8, a2);
+                    vst1q_s32(iacc + off + 12, a3);
+                }
+                for (; off < jb; off++) {
+                    iacc[off] += (int32_t) row[ii[off]];
+                }
+            } else {
+                const PqLut256 L = pq_lut256_load(row);
+                int off = 0;
+                for (; off + 15 < jb; off += 16) {
+                    const int8x16_t qv = pq_lut256_lookup(L, vld1q_u8(ii + off));
+                    const int16x8_t qlo = vmovl_s8(vget_low_s8(qv));
+                    const int16x8_t qhi = vmovl_high_s8(qv);
+                    int32x4_t a0 = vld1q_s32(iacc + off + 0);
+                    int32x4_t a1 = vld1q_s32(iacc + off + 4);
+                    int32x4_t a2 = vld1q_s32(iacc + off + 8);
+                    int32x4_t a3 = vld1q_s32(iacc + off + 12);
+                    a0 = vaddq_s32(a0, vmovl_s16(vget_low_s16(qlo)));
+                    a1 = vaddq_s32(a1, vmovl_high_s16(qlo));
+                    a2 = vaddq_s32(a2, vmovl_s16(vget_low_s16(qhi)));
+                    a3 = vaddq_s32(a3, vmovl_high_s16(qhi));
+                    vst1q_s32(iacc + off + 0, a0);
+                    vst1q_s32(iacc + off + 4, a1);
+                    vst1q_s32(iacc + off + 8, a2);
+                    vst1q_s32(iacc + off + 12, a3);
+                }
+                for (; off < jb; off++) {
+                    iacc[off] += (int32_t) row[ii[off]];
+                }
+            }
+
+            int off = 0;
+            for (; off + 3 < jb; off += 4) {
+                float32x4_t f = vld1q_f32(facc + off);
+                f = vfmaq_n_f32(f, vcvtq_f32_s32(vld1q_s32(iacc + off)), iv);
+                vst1q_f32(facc + off, f);
+            }
+            for (; off < jb; off++) {
+                facc[off] += (float) iacc[off] * iv;
+            }
+        }
+
+        for (int u = 0; u < jb; u++) {
+            float v = facc[u];
+            if (t.scaled) {
+                v *= t.row_scale[(size_t) (jbase + u)];
+            }
+            dst[jbase + u] = v;
+        }
+        jbase += jb;
+    }
+}
 
 struct S2XBufs { const pq_f16 * xh; const int8_t * xq; float xs; int64_t sx; };
 
@@ -666,6 +925,7 @@ static void pq_s2_gemv_ds2_neon(const PQTensor & t, const S2XBufs & xb,
 static void pq_s2_gemv_scalar(const PQTensor & t, const S2XBufs & xb,
                               float * dst, int i0, int i1) {
     const int ds = t.ds;
+    const int K = t.K;
     const int din = (int) t.n_in;
     const int8_t * cb8 = t.cb8.data();
     const float * inv = t.inv.data();
@@ -673,12 +933,12 @@ static void pq_s2_gemv_scalar(const PQTensor & t, const S2XBufs & xb,
     const pq_f16 * xh = xb.xh;
 
     for (int i = i0; i < i1; i++) {
-        const int8_t * cbi = cb8 + (size_t) i * ds * GGML_PQ_K;
+        const int8_t * cbi = cb8 + (size_t) i * ds * K;
         const uint8_t * ii = idx + (size_t) i * din;
         for (int s = 0; s < ds; s++) {
             float sum = 0.f;
             for (int j = 0; j < din; j++) {
-                sum += pq_to_f32(xh[j]) * cbi[(size_t) s * GGML_PQ_K + ii[j]];
+                sum += pq_to_f32(xh[j]) * cbi[(size_t) s * K + ii[j]];
             }
             dst[(size_t) i * ds + s] = sum * inv[(size_t) i * ds + s];
         }
@@ -690,7 +950,7 @@ static void pq_s2_gemv(const PQTensor & t, const S2XBufs & xb, float * dst,
     const int M = (int) (t.n_out / t.ds);
     const int i0 = (int) ((int64_t) M * ith / nth);
     const int i1 = (int) ((int64_t) M * (ith + 1) / nth);
-    if (t.ds == 2) {
+    if (t.ds == 2 && t.K == GGML_PQ_K) {
         pq_s2_gemv_ds2_neon(t, xb, dst, i0, i1);
         return;
     }
@@ -740,15 +1000,9 @@ static void pq_s1_group_add(S1Group & g, const PQTensor & t, const void * key,
     g.xh[m] = mem[m].data();
 }
 
-static void pq_s1_flush(S1Group & g, int ith, int nth, void * threadpool, bool sync) {
-    if (!g.active) {
-        return;
-    }
-    g.active = false;
+static void pq_s1_flush_partials(S1Group & g, int ith, int nth, void * threadpool,
+                                 bool sync) {
     const int n = g.n;
-
-    const uint64_t tq0 = (ith == 0) ? ggml_time_us() : 0;
-
     size_t base[4];
     size_t need = 0;
     int Dtot = 0;
@@ -794,6 +1048,76 @@ static void pq_s1_flush(S1Group & g, int ith, int nth, void * threadpool, bool s
     if (sync) {
         pq_barrier(threadpool, nth);
     }
+}
+
+// Default Kunpeng path: shared LUT + output-owned (no O(nth x n_out) partials).
+static void pq_s1_flush_shared(S1Group & g, int ith, int nth, void * threadpool,
+                               bool sync) {
+    const int n = g.n;
+    const int n_nodes = pq_numa_n_nodes();
+    int Dtot = 0;
+    for (int m = 0; m < n; m++) {
+        Dtot += (int) g.t[m]->n_out;
+    }
+
+    // Grow scratch on thread 0 only, then barrier so no publish races a resize.
+    if (ith == 0) {
+        std::lock_guard<std::mutex> lk(g_s1_mu);
+        for (int m = 0; m < n; m++) {
+            const int M = (int) (g.t[m]->n_in / g.t[m]->ds);
+            pq_s1_ensure_luts(n_nodes, m, M, g.t[m]->K);
+        }
+    }
+    pq_barrier(threadpool, nth);
+
+    for (int m = 0; m < n; m++) {
+        const PQTensor & tm = *g.t[m];
+        const int M = (int) (tm.n_in / tm.ds);
+        const int a0 = (int) ((int64_t) M * ith / nth);
+        const int a1 = (int) ((int64_t) M * (ith + 1) / nth);
+        if (a1 > a0) {
+            pq_s1_publish_luts(tm, g.xh[m], a0, a1, m, n_nodes);
+        }
+    }
+
+    // LUTs published; output-owned phase.
+    pq_barrier(threadpool, nth);
+
+    const int node = pq_numa_node();
+    const int j0 = (int) ((int64_t) Dtot * ith / nth);
+    const int j1 = (int) ((int64_t) Dtot * (ith + 1) / nth);
+    int d0 = 0;
+    for (int m = 0; m < n; m++) {
+        const PQTensor & tm = *g.t[m];
+        const int b0 = std::max(j0, d0);
+        const int b1 = std::min(j1, d0 + (int) tm.n_out);
+        if (b1 > b0) {
+            const S1LutScratch & lut = g_s1_luts[node][m];
+            pq_s1_phase2_shared(tm, g.dst[m], b0 - d0, b1 - d0,
+                                lut.dt8.data(), lut.inv.data());
+        }
+        d0 += (int) tm.n_out;
+    }
+    if (sync) {
+        pq_barrier(threadpool, nth);
+    }
+}
+
+static void pq_s1_flush(S1Group & g, int ith, int nth, void * threadpool, bool sync) {
+    if (!g.active) {
+        return;
+    }
+    g.active = false;
+    const int n = g.n;
+
+    const uint64_t tq0 = (ith == 0) ? ggml_time_us() : 0;
+
+    if (pq_s1_use_partials()) {
+        pq_s1_flush_partials(g, ith, nth, threadpool, sync);
+    } else {
+        pq_s1_flush_shared(g, ith, nth, threadpool, sync);
+    }
+
     g.n = 0;
     g.active = false;
 
@@ -828,6 +1152,13 @@ void ggml_pq_reset(void) {
     std::lock_guard<std::mutex> lk(g_s1_mu);
     g_pq.clear();
     g_pq_enabled.store(false);
+    g_s1_partials.clear();
+    for (int node = 0; node < kMaxNumaNodes; node++) {
+        for (int s = 0; s < 4; s++) {
+            g_s1_luts[node][s].dt8.clear();
+            g_s1_luts[node][s].inv.clear();
+        }
+    }
 }
 
 void ggml_pq_set_enabled(bool v) { g_pq_enabled.store(v); }
@@ -835,26 +1166,27 @@ bool ggml_pq_enabled(void) { return g_pq_enabled.load(); }
 
 bool ggml_pq_register(const char * name, int mode, int ds,
                       const float * cb_f32, const int8_t * cb8, const float * inv,
-                      const uint8_t * idx, int64_t n_in, int64_t n_out) {
-    if (!name || ds < 1 || ds > GGML_PQ_MAX_DS) {
+                      const uint8_t * idx, int64_t n_in, int64_t n_out, int K) {
+    if (!name || ds < 1 || ds > GGML_PQ_MAX_DS || (K != GGML_PQ_K && K != GGML_PQ_K_ARM)) {
         return false;
     }
     PQTensor t;
     t.name = name;
     t.mode = mode;
     t.ds = ds;
+    t.K = K;
     t.n_in = n_in;
     t.n_out = n_out;
     if (mode == 0) {
         if (!cb_f32 || !idx) {
             return false;
         }
-        std::vector<pq_f16> tmp((size_t) (n_in / ds) * ds * GGML_PQ_K);
+        std::vector<pq_f16> tmp((size_t) (n_in / ds) * ds * K);
         for (int64_t i = 0; i < n_in / ds; i++) {
             for (int d = 0; d < ds; d++) {
-                for (int k = 0; k < GGML_PQ_K; k++) {
-                    tmp[((size_t) (i * ds + d) * GGML_PQ_K) + k] =
-                        pq_from_f32(cb_f32[((size_t) i * GGML_PQ_K + k) * ds + d]);
+                for (int k = 0; k < K; k++) {
+                    tmp[((size_t) (i * ds + d) * K) + k] =
+                        pq_from_f32(cb_f32[((size_t) i * K + k) * ds + d]);
                 }
             }
         }
@@ -864,7 +1196,7 @@ bool ggml_pq_register(const char * name, int mode, int ds,
         if (!cb8 || !inv || !idx) {
             return false;
         }
-        t.cb8.assign(cb8, (size_t) (n_out / ds) * ds * GGML_PQ_K);
+        t.cb8.assign(cb8, (size_t) (n_out / ds) * ds * K);
         t.inv.resize((size_t) (n_out / ds) * ds);
         for (size_t s = 0; s < t.inv.size(); s++) {
             t.inv[s] = inv[s] * 128.0f;
@@ -888,21 +1220,23 @@ bool ggml_pq_register(const char * name, int mode, int ds,
 
 bool ggml_pq_register_raw(const char * name, int mode, int ds, const void * cb,
                           const float * inv, const uint8_t * idx,
-                          int64_t n_in, int64_t n_out) {
-    if (!name || ds < 1 || ds > GGML_PQ_MAX_DS || !cb || !idx) {
+                          int64_t n_in, int64_t n_out, int K) {
+    if (!name || ds < 1 || ds > GGML_PQ_MAX_DS || !cb || !idx ||
+        (K != GGML_PQ_K && K != GGML_PQ_K_ARM)) {
         return false;
     }
     PQTensor t;
     t.name = name;
     t.mode = mode;
     t.ds = ds;
+    t.K = K;
     t.n_in = n_in;
     t.n_out = n_out;
     if (mode == 0) {
-        t.cbh.assign((const pq_f16 *) cb, (size_t) (n_in / ds) * ds * GGML_PQ_K);
+        t.cbh.assign((const pq_f16 *) cb, (size_t) (n_in / ds) * ds * K);
         t.idx.assign(idx, (size_t) (n_in / ds) * n_out);
     } else {
-        t.cb8.assign((const int8_t *) cb, (size_t) (n_out / ds) * ds * GGML_PQ_K);
+        t.cb8.assign((const int8_t *) cb, (size_t) (n_out / ds) * ds * K);
         t.inv.resize((size_t) (n_out / ds) * ds);
         for (size_t s = 0; s < t.inv.size(); s++) {
             t.inv[s] = inv[s] * 128.0f;
@@ -926,18 +1260,19 @@ bool ggml_pq_register_raw(const char * name, int mode, int ds, const void * cb,
 
 bool ggml_pq_register_raw_scaled(const char * name, int ds, const void * cb,
                                  const uint8_t * idx, const float * row_scale,
-                                 int64_t n_in, int64_t n_out) {
+                                 int64_t n_in, int64_t n_out, int K) {
     if (!name || ds < 1 || ds > GGML_PQ_MAX_DS || !cb || !idx || !row_scale ||
-        n_in % ds != 0) {
+        n_in % ds != 0 || (K != GGML_PQ_K && K != GGML_PQ_K_ARM)) {
         return false;
     }
     PQTensor t;
     t.name = name;
     t.mode = 0;
     t.ds = ds;
+    t.K = K;
     t.n_in = n_in;
     t.n_out = n_out;
-    t.cbh.assign((const pq_f16 *) cb, (size_t) n_in * GGML_PQ_K);
+    t.cbh.assign((const pq_f16 *) cb, (size_t) n_in * K);
     t.idx.assign(idx, (size_t) (n_in / ds) * n_out);
     t.row_scale.assign(row_scale, row_scale + n_out);
     t.scaled = true;

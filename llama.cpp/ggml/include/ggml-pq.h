@@ -31,6 +31,7 @@ extern "C" {
 
 #define GGML_PQ_MAX_DS 8
 #define GGML_PQ_K      256
+#define GGML_PQ_K_ARM  64   // NEON-friendly codebook size (single vqtbl4q)
 
 // Same-input GEMV fusion: consecutive MUL_MAT nodes sharing one input row
 // (wq/wk/wv after an rms_norm, ffn_gate/ffn_up) are computed in a single
@@ -60,11 +61,12 @@ bool ggml_pq_enabled(void);
 // mode 0 = S1 (cb_f32: [(i*K+k)*ds+d], converted to fp16 SoA internally)
 // mode 1 = S2 (cb8: [(i*ds+s)*K+k] int8, inv: [i*ds+s] dequant scale;
 //              inv is pre-multiplied by 128 here to pair with x/128)
+// K: codebook size, GGML_PQ_K (256) or GGML_PQ_K_ARM (64) for Kunpeng NEON.
 bool ggml_pq_register(const char * name, int mode, int ds,
                       const float * cb_f32,
                       const int8_t * cb8, const float * inv,
                       const uint8_t * idx,
-                      int64_t n_in, int64_t n_out);
+                      int64_t n_in, int64_t n_out, int K);
 
 // pre-packed registration (as persisted in GGUF):
 //   S1: cb is fp16 SoA [(i*ds+d)*K + k], no scales (runtime dt quantization)
@@ -74,16 +76,16 @@ bool ggml_pq_register_raw(const char * name, int mode, int ds,
                           const void * cb,
                           const float * inv,
                           const uint8_t * idx,
-                          int64_t n_in, int64_t n_out);
+                          int64_t n_in, int64_t n_out, int K);
 
 bool ggml_pq_register_raw_scaled(const char * name, int ds,
                                  const void * cb, const uint8_t * idx,
                                  const float * row_scale,
-                                 int64_t n_in, int64_t n_out);
+                                 int64_t n_in, int64_t n_out, int K);
 
 // try to run y[n_out] = W_pq * x[n_in] for one decode row.
 // x_type: GGML type of x (F32 or F16 supported).
-// threadpool: ggml_threadpool* for ggml_barrier (S1 two-phase scheme).
+// threadpool: ggml_threadpool* for ggml_barrier (S1 two-phase / shared-LUT).
 // returns false if `name` is not registered (caller falls back).
 bool ggml_pq_mul_mat_vec(const char * name, const void * x, int x_type,
                          float * dst, int64_t n_in, int64_t n_out,

@@ -49,7 +49,7 @@ static double pack_rel_mse(const struct ggml_tensor * t, const llama_pq_pack & p
         for (int64_t j = 0; j < n_out; j++) {
             for (int i = 0; i < M; i++) {
                 // idx layout is subspace-major: idx[i * n_out + j]
-                const float * cb = &p.cbf[((size_t) i * GGML_PQ_K + p.idx[(size_t) i * n_out + j]) * p.ds];
+                const float * cb = &p.cbf[((size_t) i * p.K + p.idx[(size_t) i * n_out + j]) * p.ds];
                 for (int d = 0; d < p.ds; d++) {
                     const float e = W[(size_t) j * n_in + i * p.ds + d] - cb[d];
                     se += (double) e * e;
@@ -63,7 +63,7 @@ static double pack_rel_mse(const struct ggml_tensor * t, const llama_pq_pack & p
                 const uint8_t id = p.idx[(size_t) i * n_in + pw];
                 for (int s = 0; s < p.ds; s++) {
                     const float v = p.inv[(size_t) i * p.ds + s] *
-                                    p.cb8[((size_t) i * p.ds + s) * GGML_PQ_K + id];
+                                    p.cb8[((size_t) i * p.ds + s) * p.K + id];
                     const float e = W[(size_t)(i * p.ds + s) * n_in + pw] - v;
                     se += (double) e * e;
                 }
@@ -89,6 +89,7 @@ struct ggml_tensor * make_tensor(struct ggml_context * ctx, const char * name,
 int main(int argc, char ** argv) {
     if (argc < 3) {
         fprintf(stderr, "usage: %s <input.gguf> <output.gguf> [--pq-ds N] [--pq-mode auto|s1|s2]"
+                        " [--pq-k 256|64] [--pq-target auto|kunpeng]"
                         " [--train-from <f16.gguf>] [--pq4c8b-dir <dir>]\n", argv[0]);
         return 1;
     }
@@ -97,18 +98,28 @@ int main(int argc, char ** argv) {
     const char * tr_path  = nullptr;
     const char * pq4_dir  = nullptr;
     int ds = 2;
+    int pq_k = GGML_PQ_K;
     int mode_cfg = 0; // 0=auto, 1=s1, 2=s2
+    int target = 0;   // 0=auto (x86 heuristic), 1=kunpeng (prefer S2)
     for (int i = 3; i < argc; i++) {
         if (!strcmp(argv[i], "--train-from") && i + 1 < argc) tr_path = argv[++i];
         else if (!strcmp(argv[i], "--pq4c8b-dir") && i + 1 < argc) pq4_dir = argv[++i];
         else if (!strncmp(argv[i], "--pq-ds=", 8))      ds = atoi(argv[i] + 8);
         else if (!strcmp(argv[i], "--pq-ds") && i + 1 < argc) ds = atoi(argv[++i]);
+        else if (!strncmp(argv[i], "--pq-k=", 7))       pq_k = atoi(argv[i] + 7);
+        else if (!strcmp(argv[i], "--pq-k") && i + 1 < argc) pq_k = atoi(argv[++i]);
         else if (!strncmp(argv[i], "--pq-mode=", 10)) {
             const char * m = argv[i] + 10;
             mode_cfg = !strcmp(m, "s1") ? 1 : (!strcmp(m, "s2") ? 2 : 0);
         } else if (!strcmp(argv[i], "--pq-mode") && i + 1 < argc) {
             const char * m = argv[++i];
             mode_cfg = !strcmp(m, "s1") ? 1 : (strcmp(m, "s2") ? 0 : 2);
+        } else if (!strncmp(argv[i], "--pq-target=", 12)) {
+            const char * t = argv[i] + 12;
+            target = !strcmp(t, "kunpeng") ? 1 : 0;
+        } else if (!strcmp(argv[i], "--pq-target") && i + 1 < argc) {
+            const char * t = argv[++i];
+            target = !strcmp(t, "kunpeng") ? 1 : 0;
         } else {
             fprintf(stderr, "unknown arg: %s\n", argv[i]);
             return 1;
@@ -117,6 +128,18 @@ int main(int argc, char ** argv) {
     if (ds < 1 || ds > GGML_PQ_MAX_DS) {
         fprintf(stderr, "invalid --pq-ds %d\n", ds);
         return 1;
+    }
+    if (pq_k != GGML_PQ_K && pq_k != GGML_PQ_K_ARM) {
+        fprintf(stderr, "invalid --pq-k %d (want 256 or 64)\n", pq_k);
+        return 1;
+    }
+    // Kunpeng target: prefer ARM-friendly S2 + ds=2 unless caller forced mode/ds.
+    if (target == 1) {
+        if (mode_cfg == 0) {
+            mode_cfg = 2; // all S2
+        }
+        fprintf(stderr, "%s: pq-target=kunpeng (mode_cfg=%s ds=%d) — online quant, not EdgePQ-4c8b\n",
+                __func__, mode_cfg == 1 ? "s1" : (mode_cfg == 2 ? "s2" : "auto"), ds);
     }
 
     fprintf(stderr, "%s: loading %s\n", __func__, in_path);
@@ -149,6 +172,7 @@ int main(int argc, char ** argv) {
     gguf_set_kv(ctx_out, ctx_in_meta);
     gguf_set_val_u32(ctx_out, "pq.ds", ds);
     gguf_set_val_u32(ctx_out, "pq.mode", mode_cfg);
+    gguf_set_val_u32(ctx_out, "pq.k", pq_k);
 
     const int n_tensors = gguf_get_n_tensors(ctx_in_meta);
     int n_pq = 0;
@@ -225,10 +249,10 @@ int main(int argc, char ** argv) {
             }
         }
         llama_pq_pack pack;
-        if (!llama_pq_build_pack(t_tr, mode, ds, pack)) continue;
+        if (!llama_pq_build_pack(t_tr, mode, ds, pack, pq_k)) continue;
 
         // meta = { mode, ds, K, M }
-        const int32_t meta[4] = { mode, ds, GGML_PQ_K,
+        const int32_t meta[4] = { mode, ds, pq_k,
                                   (int32_t)(mode == 0 ? t->ne[0] / ds : t->ne[1] / ds) };
         storages.emplace_back(sizeof(meta));
         memcpy(storages.back().data(), meta, sizeof(meta));
@@ -251,7 +275,7 @@ int main(int argc, char ** argv) {
         if (mode == 0) {
             // S1: cb F32 [ds, K, M] (layout [(i*K+k)*ds+d]); idx I8 [n_out, M]
             const int M = (int)(t->ne[0] / ds);
-            const int64_t ne_cb[3] = { ds, GGML_PQ_K, M };
+            const int64_t ne_cb[3] = { ds, pq_k, M };
             add_side("pq_cb", GGML_TYPE_F32, 3, ne_cb, pack.cbf.data(),
                      pack.cbf.size() * sizeof(float));
             const int64_t ne_idx[2] = { t->ne[1], M };
@@ -259,7 +283,7 @@ int main(int argc, char ** argv) {
         } else {
             // S2: cb I8 [K, M*ds]; inv F32 [M*ds]; idx I8 [n_in, M]
             const int M = (int)(t->ne[1] / ds);
-            const int64_t ne_cb[2] = { GGML_PQ_K, M * ds };
+            const int64_t ne_cb[2] = { pq_k, M * ds };
             add_side("pq_cb", GGML_TYPE_I8, 2, ne_cb, pack.cb8.data(), pack.cb8.size());
             const int64_t ne_inv[1] = { M * ds };
             add_side("pq_inv", GGML_TYPE_F32, 1, ne_inv, pack.inv.data(),
@@ -268,8 +292,8 @@ int main(int argc, char ** argv) {
             add_side("pq_idx", GGML_TYPE_I8, 2, ne_idx, pack.idx.data(), pack.idx.size());
         }
         n_pq++;
-        fprintf(stderr, "%s: PQ packed '%s' (mode=%s ds=%d rel_mse=%.3e)\n", __func__, name,
-                mode == 0 ? "S1" : "S2", ds, pack_rel_mse(t_tr, pack));
+        fprintf(stderr, "%s: PQ packed '%s' (mode=%s ds=%d K=%d rel_mse=%.3e)\n", __func__, name,
+                mode == 0 ? "S1" : "S2", ds, pq_k, pack_rel_mse(t_tr, pack));
     }
 
     fprintf(stderr, "%s: %d tensors PQ-packed, writing %s ...\n", __func__, n_pq, out_path);

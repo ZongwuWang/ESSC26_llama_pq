@@ -3,6 +3,7 @@
 #pragma once
 
 #include "llama.h"
+#include "ggml-pq.h"
 
 #include <cstdint>
 #include <vector>
@@ -21,6 +22,7 @@ void llama_pq_finish(void);
 struct llama_pq_pack {
     int     mode = 0;            // 0 = S1 (input-dim), 1 = S2 (output-dim)
     int     ds = 2;
+    int     K = GGML_PQ_K;       // 256 or GGML_PQ_K_ARM (64)
     int64_t n_in = 0, n_out = 0;
     // S1: [(i*K+k)*ds+d] fp32 (K centroids per subspace, ds dims each)
     std::vector<float>   cbf;
@@ -41,11 +43,12 @@ struct llama_pq_pack {
 // Returns false if the tensor is unsuitable (too small, dims not divisible
 // by ds, non-contiguous).
 bool llama_pq_build_pack(struct ggml_tensor * t, int mode, int ds,
-                         llama_pq_pack & out);
+                         llama_pq_pack & out, int K = GGML_PQ_K);
 
 // Quantize + register with the ggml-cpu PQ registry. Returns false if the
 // tensor is unsuitable.
-bool llama_pq_register_tensor(struct ggml_tensor * t, int mode, int ds);
+bool llama_pq_register_tensor(struct ggml_tensor * t, int mode, int ds,
+                              int K = GGML_PQ_K);
 
 // If GGUF contains pre-computed PQ side tensors for `base` (e.g.
 // "blk.0.attn_q.weight.pq_meta/.pq_cb/.pq_idx"), load them and register.

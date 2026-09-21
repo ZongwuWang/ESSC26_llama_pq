@@ -718,8 +718,8 @@ bool ggml_pq_register(const char * name, int mode, int ds,
                       const float * cb_f32,
                       const int8_t * cb8, const float * inv,
                       const uint8_t * idx,
-                      int64_t n_in, int64_t n_out) {
-    if (!name || ds < 1 || ds > GGML_PQ_MAX_DS) return false;
+                      int64_t n_in, int64_t n_out, int K) {
+    if (!name || ds < 1 || ds > GGML_PQ_MAX_DS || (K != GGML_PQ_K && K != GGML_PQ_K_ARM)) return false;
     PQTensor t;
     t.name = name;
     t.mode = mode;
@@ -730,17 +730,17 @@ bool ggml_pq_register(const char * name, int mode, int ds,
         if (!cb_f32 || !idx) return false;
         {
             // build fp16 SoA codebook in a temp vector, then land it on huge pages
-            std::vector<_Float16> tmp((size_t)(n_in / ds) * ds * GGML_PQ_K);
+            std::vector<_Float16> tmp((size_t)(n_in / ds) * ds * K);
             for (int64_t i = 0; i < n_in / ds; i++)
                 for (int d = 0; d < ds; d++)
-                    for (int k = 0; k < GGML_PQ_K; k++)
-                        tmp[((size_t)(i * ds + d) * GGML_PQ_K) + k] = (_Float16)cb_f32[((size_t)i * GGML_PQ_K + k) * ds + d];
+                    for (int k = 0; k < K; k++)
+                        tmp[((size_t)(i * ds + d) * K) + k] = (_Float16)cb_f32[((size_t)i * K + k) * ds + d];
             t.cbh.assign(tmp.data(), tmp.size());
         }
         t.idx.assign(idx, (size_t)(n_in / ds) * n_out);
     } else {
         if (!cb8 || !inv || !idx) return false;
-        t.cb8.assign(cb8, (size_t)(n_out / ds) * ds * GGML_PQ_K);
+        t.cb8.assign(cb8, (size_t)(n_out / ds) * ds * K);
         t.inv.resize((size_t)(n_out / ds) * ds);
         for (size_t s = 0; s < t.inv.size(); s++) t.inv[s] = inv[s] * 128.0f;
         t.cb8u.assign(t.cb8.data(), t.cb8.size());
@@ -764,8 +764,9 @@ bool ggml_pq_register_raw(const char * name, int mode, int ds,
                           const void * cb,
                           const float * inv,
                           const uint8_t * idx,
-                          int64_t n_in, int64_t n_out) {
-    if (!name || ds < 1 || ds > GGML_PQ_MAX_DS || !cb || !idx) return false;
+                          int64_t n_in, int64_t n_out, int K) {
+    if (!name || ds < 1 || ds > GGML_PQ_MAX_DS || !cb || !idx ||
+        (K != GGML_PQ_K && K != GGML_PQ_K_ARM)) return false;
     PQTensor t;
     t.name = name;
     t.mode = mode;
@@ -775,11 +776,11 @@ bool ggml_pq_register_raw(const char * name, int mode, int ds,
     if (mode == 0) {
         // fp16 SoA [(i*ds+d)*K+k] — direct copy
         const _Float16 * cbh = (const _Float16 *)cb;
-        t.cbh.assign(cbh, (size_t)(n_in / ds) * ds * GGML_PQ_K);
+        t.cbh.assign(cbh, (size_t)(n_in / ds) * ds * K);
         t.idx.assign(idx, (size_t)(n_in / ds) * n_out);
     } else {
         // int8 codebook + float scales (scaled by 128 here)
-        t.cb8.assign((const int8_t *)cb, (size_t)(n_out / ds) * ds * GGML_PQ_K);
+        t.cb8.assign((const int8_t *)cb, (size_t)(n_out / ds) * ds * K);
         t.inv.resize((size_t)(n_out / ds) * ds);
         for (size_t s = 0; s < t.inv.size(); s++) t.inv[s] = inv[s] * 128.0f;
         t.cb8u.assign(t.cb8.data(), t.cb8.size());
@@ -802,11 +803,12 @@ bool ggml_pq_register_raw(const char * name, int mode, int ds,
 bool ggml_pq_register_raw_scaled(const char * name, int ds,
                                  const void * cb, const uint8_t * idx,
                                  const float * row_scale,
-                                 int64_t n_in, int64_t n_out) {
-    if (!name || ds < 1 || ds > GGML_PQ_MAX_DS || !cb || !idx || !row_scale || n_in % ds != 0) return false;
+                                 int64_t n_in, int64_t n_out, int K) {
+    if (!name || ds < 1 || ds > GGML_PQ_MAX_DS || !cb || !idx || !row_scale ||
+        n_in % ds != 0 || (K != GGML_PQ_K && K != GGML_PQ_K_ARM)) return false;
     PQTensor t;
     t.name = name; t.mode = 0; t.ds = ds; t.n_in = n_in; t.n_out = n_out;
-    t.cbh.assign((const _Float16 *) cb, (size_t) n_in * GGML_PQ_K);
+    t.cbh.assign((const _Float16 *) cb, (size_t) n_in * K);
     t.idx.assign(idx, (size_t) (n_in / ds) * n_out);
     t.row_scale.assign(row_scale, row_scale + n_out);
     t.scaled = true;
@@ -1058,11 +1060,11 @@ void ggml_pq_reset(void) {}
 void ggml_pq_set_enabled(bool) {}
 bool ggml_pq_enabled(void) { return false; }
 bool ggml_pq_register(const char *, int, int, const float *, const int8_t *,
-                      const float *, const uint8_t *, int64_t, int64_t) { return false; }
+                      const float *, const uint8_t *, int64_t, int64_t, int) { return false; }
 bool ggml_pq_register_raw(const char *, int, int, const void *, const float *,
-                          const uint8_t *, int64_t, int64_t) { return false; }
+                          const uint8_t *, int64_t, int64_t, int) { return false; }
 bool ggml_pq_register_raw_scaled(const char *, int, const void *, const uint8_t *,
-                                 const float *, int64_t, int64_t) { return false; }
+                                 const float *, int64_t, int64_t, int) { return false; }
 bool ggml_pq_mul_mat_vec(const char *, const void *, int, float *,
                          int64_t, int64_t, int, int, void *) { return false; }
 int ggml_pq_mul_mat_fused(const char *, const void *, const void *, int, float *,

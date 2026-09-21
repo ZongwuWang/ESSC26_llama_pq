@@ -93,8 +93,9 @@ LLAMA_LDLIBS := -lllama -lggml -lggml-cpu -lggml-base -lpthread -ldl -lm
 .PHONY: help all demo env prepare-edgepq prepare-baselines prepare-dataset prepare-inputs \
 	check-benchmark-inputs check-ppl-inputs check-pq-ppl-inputs check-inputs \
 	llama-build llama_pq prepare-chat-model chat selftest smoke benchmark ppl pq-ppl \
-	plot clean distclean kunpeng-check kunpeng-build kunpeng-selftest \
-	kunpeng-smoke kunpeng-benchmark kunpeng-chat
+	plot clean distclean kunpeng-check kunpeng-verify-isa kunpeng-build kunpeng-selftest \
+	kunpeng-smoke kunpeng-benchmark kunpeng-chat kunpeng-pq-meta kunpeng-export-s2 \
+	kunpeng-export-k64 kunpeng-export-mix kunpeng-thread-sweep
 
 help:
 	@echo "EdgePQ artifact targets:"
@@ -115,11 +116,17 @@ help:
 	@echo ""
 	@echo "Kunpeng / aarch64 targets (see docs/DEPLOY_KUNPENG.md):"
 	@echo "  make kunpeng-check      Verify host is aarch64 and print CPU info"
-	@echo "  make kunpeng-build      CPU-only build (GGML_CUDA=OFF)"
+	@echo "  make kunpeng-verify-isa Build + confirm pq-gemv-arm.cpp has fp16+dotprod"
+	@echo "  make kunpeng-build      CPU-only build (GGML_CUDA=OFF, armv8.2+fp16+dotprod)"
 	@echo "  make kunpeng-selftest   Build + PQ numeric self-test"
 	@echo "  make kunpeng-smoke      8-token F16/Q2_K/EdgePQ smoke test"
 	@echo "  make kunpeng-benchmark  Decode throughput -> output/throughput.csv"
 	@echo "  make kunpeng-chat       Interactive EdgePQ chat on all CPU cores"
+	@echo "  make kunpeng-pq-meta    Print pq_meta modes in PQ_MODEL (expect mode=4)"
+	@echo "  make kunpeng-export-s2  Online S2 K=256 A/B from F16 (not trained 4c8b)"
+	@echo "  make kunpeng-export-k64 Online S1 K=64 ds=4 (NEON single-tbl) from F16"
+	@echo "  make kunpeng-export-mix Online auto S1/S2 K=64 mix from F16"
+	@echo "  make kunpeng-thread-sweep Phase0 stable thread sweep (unset S1_PARTIALS)"
 
 
 all:
@@ -293,11 +300,22 @@ check-pq-ppl-inputs:
 check-inputs: check-benchmark-inputs check-ppl-inputs check-pq-ppl-inputs
 	@echo "[OK] All required models, checkpoint files, tokenizer files, and dataset are present"
 
+# On Kunpeng/aarch64, force armv8.2-a+fp16+dotprod so pq-gemv-arm.cpp
+# compiles the FP16 vector + SDOT paths (not scalar / vmull fallbacks).
+ifeq ($(UNAME_M),aarch64)
+GGML_CPU_ARM_ARCH ?= armv8.2-a+fp16+dotprod
+CMAKE_ARM_ARCH_ARG := -DGGML_CPU_ARM_ARCH="$(GGML_CPU_ARM_ARCH)"
+else
+CMAKE_ARM_ARCH_ARG :=
+endif
+
 $(LLAMA_BUILD)/build.ninja: $(LLAMA_SRC)/CMakeLists.txt
 	$(SYSTEM_BUILD_ENV) $(CMAKE) -S "$(LLAMA_SRC)" -B "$(LLAMA_BUILD)" -G Ninja \
 		-DCMAKE_BUILD_TYPE=Release -DGGML_NATIVE=ON -DGGML_CUDA=$(GGML_CUDA) \
+		-DCMAKE_EXPORT_COMPILE_COMMANDS=ON \
 		-DLLAMA_BUILD_TOOLS=ON -DLLAMA_BUILD_MTMD=OFF -DLLAMA_BUILD_UI=OFF \
-		-DLLAMA_OPENSSL=OFF -DCMAKE_C_COMPILER="$(CC)" -DCMAKE_CXX_COMPILER="$(CXX)" $(CUDA_COMPILER_ARG)
+		-DLLAMA_OPENSSL=OFF -DCMAKE_C_COMPILER="$(CC)" -DCMAKE_CXX_COMPILER="$(CXX)" \
+		$(CMAKE_ARM_ARCH_ARG) $(CUDA_COMPILER_ARG)
 
 llama-build: $(LLAMA_BUILD)/build.ninja
 	$(SYSTEM_BUILD_ENV) $(NINJA) -C "$(LLAMA_BUILD)" \
@@ -378,11 +396,28 @@ kunpeng-check:
 	}
 	@echo "[OK] arch=$(UNAME_M) nproc=$(NPROC) GGML_CUDA=$(GGML_CUDA) AE_THREADS=$(AE_THREADS)"
 	@echo "[OK] CHAT_CPU_RANGE=$(CHAT_CPU_RANGE) AE_NUMA=$(AE_NUMA)"
+	@echo "[OK] GGML_CPU_ARM_ARCH=$(GGML_CPU_ARM_ARCH)"
 	@command -v $(CMAKE) >/dev/null || { echo "[ERROR] cmake not found" >&2; exit 1; }
 	@command -v $(NINJA) >/dev/null || { echo "[ERROR] ninja not found" >&2; exit 1; }
 	@command -v $(CXX) >/dev/null || { echo "[ERROR] C++ compiler not found: $(CXX)" >&2; exit 1; }
 	@(grep -E 'Features|Flags' /proc/cpuinfo 2>/dev/null | head -3) || true
 	@echo "[OK] Host toolchain ready for Kunpeng NEON PQ path (pq-gemv-arm.cpp)"
+
+kunpeng-verify-isa: kunpeng-build
+	@test -f "$(LLAMA_BUILD)/compile_commands.json" || { \
+		echo "[ERROR] missing $(LLAMA_BUILD)/compile_commands.json (reconfigure with EXPORT_COMPILE_COMMANDS)" >&2; \
+		exit 1; \
+	}
+	@echo "[CHECK] pq-gemv-arm.cpp march flags:"
+	@python3 -c 'import json,sys; p="$(LLAMA_BUILD)/compile_commands.json"; \
+		cmds=json.load(open(p)); \
+		hits=[c for c in cmds if "pq-gemv-arm.cpp" in c.get("file","")]; \
+		sys.exit("[ERROR] pq-gemv-arm.cpp not in compile_commands.json") if not hits else None; \
+		cmd=hits[0].get("command") or " ".join(hits[0].get("arguments",[])); \
+		print(cmd); \
+		need=("fp16","dotprod"); \
+		missing=[x for x in need if x not in cmd]; \
+		sys.exit("[ERROR] missing ISA flags in march: "+",".join(missing)) if missing else print("[OK] fp16+dotprod present in compile flags")'
 
 kunpeng-build: kunpeng-check
 	$(MAKE) llama-build GGML_CUDA=OFF
@@ -400,6 +435,46 @@ kunpeng-benchmark: kunpeng-check
 kunpeng-chat: kunpeng-check
 	$(MAKE) chat GGML_CUDA=OFF CHAT_THREADS="$(CHAT_THREADS)" \
 		CHAT_CPU_RANGE="$(CHAT_CPU_RANGE)"
+
+# Inspect pq_meta modes in a GGUF (EdgePQ-4c8b should be all mode=4 / scaled S1).
+kunpeng-pq-meta:
+	@if test -x "$(PYTHON)"; then \
+		$(PYTHON) scripts/kunpeng_pq_meta_check.py "$(PQ_MODEL)"; \
+	else \
+		python3 scripts/kunpeng_pq_meta_check.py "$(PQ_MODEL)"; \
+	fi
+
+# A/B: online S2 re-quant from F16 (NOT trained EdgePQ-4c8b codebooks).
+PQ_S2_MODEL ?= $(MODEL_DIR)/base-pq-s2-kunpeng.gguf
+PQ_K64_MODEL ?= $(MODEL_DIR)/base-pq-k64-kunpeng.gguf
+PQ_MIX_MODEL ?= $(MODEL_DIR)/base-pq-mix-k64-kunpeng.gguf
+
+kunpeng-export-s2: llama-build
+	@test -f "$(FP16_MODEL)" || { echo "[ERROR] missing F16 model: $(FP16_MODEL)" >&2; exit 1; }
+	$(LLAMA_BUILD)/bin/llama-pq-convert "$(FP16_MODEL)" "$(PQ_S2_MODEL)" \
+		--pq-target kunpeng --pq-mode s2 --pq-ds 2 --pq-k 256 --train-from "$(FP16_MODEL)"
+	@echo "[OK] wrote $(PQ_S2_MODEL) (online S2 K=256; PPL != EdgePQ-4c8b)"
+
+# Phase2A: ARM-friendly S1 with K=64 (single vqtbl4q), ds=4.
+kunpeng-export-k64: llama-build
+	@test -f "$(FP16_MODEL)" || { echo "[ERROR] missing F16 model: $(FP16_MODEL)" >&2; exit 1; }
+	$(LLAMA_BUILD)/bin/llama-pq-convert "$(FP16_MODEL)" "$(PQ_K64_MODEL)" \
+		--pq-mode s1 --pq-ds 4 --pq-k 64 --train-from "$(FP16_MODEL)"
+	@echo "[OK] wrote $(PQ_K64_MODEL) (online S1 K=64 ds=4; measure PPL vs 4c8b)"
+
+# Phase2B: auto mix (ffn_down->S2, rest S1) with K=64 for Kunpeng A/B.
+kunpeng-export-mix: llama-build
+	@test -f "$(FP16_MODEL)" || { echo "[ERROR] missing F16 model: $(FP16_MODEL)" >&2; exit 1; }
+	$(LLAMA_BUILD)/bin/llama-pq-convert "$(FP16_MODEL)" "$(PQ_MIX_MODEL)" \
+		--pq-mode auto --pq-ds 2 --pq-k 64 --train-from "$(FP16_MODEL)"
+	@echo "[OK] wrote $(PQ_MIX_MODEL) (auto S1/S2 K=64; measure PPL vs 4c8b)"
+
+# Phase0: thread sweep with GGML_PQ_S1_PARTIALS unset (stable-bench script).
+kunpeng-thread-sweep:
+	@chmod +x scripts/kunpeng_stable_bench.sh
+	env -u GGML_PQ_S1_PARTIALS THREADS_LIST="$(or $(THREADS_LIST),16,24,32,48,60)" \
+		AE_NUMA="$(AE_NUMA)" AE_REPETITIONS="$(AE_REPETITIONS)" \
+		./scripts/kunpeng_stable_bench.sh
 
 clean:
 	rm -f llama_pq

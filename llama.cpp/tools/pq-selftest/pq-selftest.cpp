@@ -55,7 +55,7 @@ static int test_s1_direct(int n_in, int n_out) {
 
     ggml_pq_reset();
     if (!ggml_pq_register_raw("test.s1", /*mode=*/0, ds, cb.data(), nullptr,
-                              idx.data(), n_in, n_out)) {
+                              idx.data(), n_in, n_out, GGML_PQ_K)) {
         fprintf(stderr, "S1 direct: register failed\n");
         return 1;
     }
@@ -130,7 +130,7 @@ static int test_s1_fusion(int nth, int n_in, int n_out) {
         char nm[64];
         snprintf(nm, sizeof(nm), "test.w%d", t);
         if (!ggml_pq_register_raw(nm, /*mode=*/0, ds, cb[t].data(), nullptr,
-                                  idx[t].data(), n_in, n_out)) {
+                                  idx[t].data(), n_in, n_out, GGML_PQ_K)) {
             fprintf(stderr, "S1 fusion: register failed\n");
             return 1;
         }
@@ -254,7 +254,7 @@ static int test_s2_direct(int nth, int n_in, int n_out) {
 
     ggml_pq_reset();
     if (!ggml_pq_register_raw("test.s2", /*mode=*/1, ds, cb8.data(), inv.data(),
-                              idx.data(), n_in, n_out)) {
+                              idx.data(), n_in, n_out, GGML_PQ_K)) {
         fprintf(stderr, "S2 register failed\n");
         return 1;
     }

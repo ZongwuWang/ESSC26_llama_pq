@@ -1,9 +1,10 @@
 // PQ decode-time GEMV for ARM64 (Huawei Kunpeng / aarch64).
 //
 // Mirrors the public ggml_pq_* API in pq-gemv.cpp (AVX-512 x86 path).
-// S1 (EdgePQ-4c8b, ds=4): shared LUT + output-owned accumulate by default
-// (set GGML_PQ_S1_PARTIALS=1 for the legacy nth partial-y reduce). NUMA: LUT
-// scratch is replicated per node (disable with GGML_PQ_NUMA_LUT=0).
+// S1 (EdgePQ-4c8b, ds=4): phase1 block + fp16 partial-y reduce by default on
+// aarch64 (~18 tok/s on Kunpeng). Shared-LUT + output-owned is opt-in via
+// GGML_PQ_S1_SHARED=1 (publish_luts regressed to ~7 tok/s vs partials). NUMA:
+// LUT scratch is replicated per node (disable with GGML_PQ_NUMA_LUT=0).
 #include "ggml-pq.h"
 
 #if defined(__aarch64__)
@@ -171,8 +172,16 @@ static int pq_numa_node(void) {
 }
 
 static bool pq_s1_use_partials(void) {
-    static const bool v = getenv("GGML_PQ_S1_PARTIALS") != nullptr;
-    return v;
+    // Kunpeng throughput: partials + pq_s1_phase1_ds4_block (~18 tok/s). The
+    // shared-LUT flush (publish + phase2_shared) is ~7 tok/s even with float FMA.
+    const char * shared = getenv("GGML_PQ_S1_SHARED");
+    if (shared != nullptr && shared[0] != '\0' && shared[0] != '0') {
+        return false;
+    }
+    if (getenv("GGML_PQ_S1_PARTIALS") != nullptr) {
+        return true; // legacy: variable present => partials (even "=0")
+    }
+    return true;
 }
 
 static void pq_s1_ensure_luts(int n_nodes, int slot, int M, int K) {
